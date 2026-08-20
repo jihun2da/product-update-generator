@@ -458,7 +458,23 @@ def process_cafe24(dudu_bytes, today_str):
 
     # 2번시트 그룹
     df_sheet2 = df.copy()
-    for name in ['김하늘', '서송이', '이지민', '해피', '김다혜']:
+
+    # 김하늘: 소비자가(T열)/판매가(V열) = 공급가(U열) * 1.7
+    df_kim_haneul = df_sheet2.copy()
+    if all(c in df_kim_haneul.columns for c in ['소비자가', '공급가', '판매가']):
+        supply_numeric = pd.to_numeric(df_kim_haneul['공급가'], errors='coerce')
+        computed_price = (supply_numeric * 1.7).round()
+        df_kim_haneul['소비자가'] = computed_price
+        df_kim_haneul['판매가'] = computed_price
+    outputs['김하늘.xlsx'] = df_to_xlsx_bytes(df_kim_haneul, sheet_name="2번시트")
+
+    # 서송이: 적립금(AB열) 값을 모두 비움
+    df_seo = df_sheet2.copy()
+    if '적립금' in df_seo.columns:
+        df_seo['적립금'] = None
+    outputs['서송이.xlsx'] = df_to_xlsx_bytes(df_seo, sheet_name="2번시트")
+
+    for name in ['이지민', '해피', '김다혜']:
         outputs[f'{name}.xlsx'] = df_to_xlsx_bytes(df_sheet2, sheet_name="2번시트")
 
     # 3번시트 그룹
@@ -510,9 +526,13 @@ def process_cafe24(dudu_bytes, today_str):
     )
     outputs['백성희.xlsx'] = df_to_xlsx_bytes(df_modified, sheet_name="5번시트")
 
-    # 모나마켓
+    # 모나마켓: 진열상태(C열)/판매상태(D열)을 N으로 생성
     for label in ['모나마켓']:
         df_choi = df_modified.copy()
+        if '진열상태' in df_choi.columns:
+            df_choi['진열상태'] = 'N'
+        if '판매상태' in df_choi.columns:
+            df_choi['판매상태'] = 'N'
         df_choi[column_name] = df_choi[column_name].astype(str) + f' 26가을 {label}'
         outputs[f'{label}.xlsx'] = df_to_xlsx_bytes(df_choi, sheet_name="5번시트")
 
