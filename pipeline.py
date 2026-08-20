@@ -38,6 +38,16 @@ def safe_str(value):
     return str(value)
 
 
+def str_series(series):
+    """DataFrame 컬럼(Series)을 안전하게 문자열 Series로 변환.
+    pandas는 read_excel(dtype=str)로 읽어도, 그리고 그 뒤에 .astype(str)을 다시 호출해도
+    빈 셀(NaN)은 실제로는 float(nan)으로 남아있는 경우가 있어(컬럼이 이미 'str' dtype으로
+    표시되면 astype(str) 재호출이 아무 동작도 하지 않음), 나중에 '|'.join() 등에서
+    "expected str instance, float found" 오류가 날 수 있습니다. fillna('')를 먼저 적용해
+    빈 셀을 확실히 빈 문자열로 만든 뒤 문자열로 변환합니다."""
+    return series.fillna('').astype(str)
+
+
 def normalize_header(value):
     if value is None:
         return ''
@@ -740,7 +750,7 @@ def apply_category_mapping(df_dudu, outputs, n_file_info, mapping_df, target_col
         if stem not in mapping_df.columns:
             continue
 
-        mapping_dict = dict(zip(mapping_df['원본'].astype(str), mapping_df[stem].astype(str)))
+        mapping_dict = dict(zip(str_series(mapping_df['원본']), str_series(mapping_df[stem])))
 
         wb = load_wb(outputs[filename], data_only=False)
         ws = wb.active
@@ -767,7 +777,7 @@ def apply_category_mapping(df_dudu, outputs, n_file_info, mapping_df, target_col
         if target_col not in mapping_df.columns:
             warnings.append(f"'{target_col}' 컬럼이 카테고리번호.xlsx에 없어 스마트스토어(N) 파일 매핑을 생략했습니다.")
         else:
-            t_map = dict(zip(mapping_df['원본'].astype(str), mapping_df[target_col].astype(str)))
+            t_map = dict(zip(str_series(mapping_df['원본']), str_series(mapping_df[target_col])))
             for info in n_file_info:
                 fname = info['filename']
                 if fname not in outputs:
@@ -808,7 +818,7 @@ def apply_category_mapping_to_self(stage1_outputs, mapping_df, keys=('문정희.
             warnings.append(f"카테고리번호.xlsx에 '{stem}' 컬럼이 없어 {filename}의 E열 카테고리 매핑을 건너뜀")
             continue
 
-        mapping_dict = dict(zip(mapping_df['원본'].astype(str), mapping_df[stem].astype(str)))
+        mapping_dict = dict(zip(str_series(mapping_df['원본']), str_series(mapping_df[stem])))
 
         wb = load_wb(stage1_outputs[filename], data_only=False)
         ws = wb.active
