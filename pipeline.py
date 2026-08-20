@@ -786,6 +786,54 @@ def apply_category_mapping(df_dudu, outputs, n_file_info, mapping_df, target_col
     return outputs, warnings
 
 
+def apply_category_mapping_to_self(stage1_outputs, mapping_df, keys=('문정희.xlsx', '곽충현.xlsx')):
+    """1단계 산출물인 문정희.xlsx / 곽충현.xlsx의 E열('상품분류 번호')을,
+    2단계 판매처 파일들과 동일한 방식(카테고리번호.xlsx의 '원본' -> 해당 판매처 컬럼)으로
+    매핑해 갱신합니다.
+
+    2단계 apply_category_mapping()과 달리 이 두 파일은 0단계(옵션ver3 확장 전)에서
+    만들어져 두두사사(df_dudu)와 행 수/순서가 다를 수 있으므로, df_dudu 값을 위치로
+    가져오는 대신 파일 자신이 이미 가지고 있는 E열 값을 그대로 매핑 키로 사용합니다.
+    F/G열은 2단계와 동일하게(원본 코드 그대로) 건드리지 않습니다.
+    """
+    warnings = []
+    if mapping_df is None or '원본' not in mapping_df.columns:
+        return stage1_outputs, warnings
+
+    for filename in keys:
+        if filename not in stage1_outputs:
+            continue
+        stem = filename[:-5]
+        if stem not in mapping_df.columns:
+            warnings.append(f"카테고리번호.xlsx에 '{stem}' 컬럼이 없어 {filename}의 E열 카테고리 매핑을 건너뜀")
+            continue
+
+        mapping_dict = dict(zip(mapping_df['원본'].astype(str), mapping_df[stem].astype(str)))
+
+        wb = load_wb(stage1_outputs[filename], data_only=False)
+        ws = wb.active
+
+        e_col = None
+        for cell in ws[1]:
+            if safe_str(cell.value).strip() == '상품분류 번호':
+                e_col = cell.column
+                break
+        if e_col is None:
+            warnings.append(f"{filename}에서 '상품분류 번호'(E열) 컬럼을 찾을 수 없어 카테고리 매핑을 건너뜀")
+            continue
+
+        for r in range(2, ws.max_row + 1):
+            raw_e = safe_str(ws.cell(row=r, column=e_col).value)
+            if not raw_e:
+                continue
+            mapped = [mapping_dict.get(code.strip(), code.strip()) for code in raw_e.split('|') if code.strip()]
+            ws.cell(row=r, column=e_col).value = '|'.join(mapped)
+
+        stage1_outputs[filename] = wb_bytes(wb)
+
+    return stage1_outputs, warnings
+
+
 def append_mapping_to_auto_file(outputs, n_file_info):
     """N파일(들)의 B열(카테고리코드) 값을, N파일이 여러 청크로 나뉘어 있어도
     전체 행 순서 그대로 이어붙여 오토.xlsx 상품명 뒤에 추가."""
@@ -860,6 +908,8 @@ def run_pipeline(
 
     반환: {
         'stage1': {파일명: bytes, ...},   # 예제/새기린/날짜파일/두두사사/다음S파일/카테고리번호/곽충현/문정희
+                                          # (곽충현/문정희는 카테고리번호.xlsx의 '곽충현'/'문정희' 컬럼이
+                                          #  있으면 그 값으로 E열이 매핑된 상태로 생성됩니다)
         'stage2': {파일명: bytes, ...},   # 18개 판매처 파일(문정희 제외, 1단계에서 생성) + N파일(500행 초과 시 -1, -2...로 분할)
         'logs': [str, ...],
         'errors': [str, ...],
@@ -913,6 +963,10 @@ def run_pipeline(
     except Exception as e:
         errors.append(f"카테고리번호.xlsx를 읽는 중 오류: {e}")
         mapping_df = None
+
+    if mapping_df is not None:
+        stage1, moon_kwak_warnings = apply_category_mapping_to_self(stage1, mapping_df)
+        logs += moon_kwak_warnings
 
     stage2 = {}
     try:
