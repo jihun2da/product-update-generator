@@ -126,10 +126,46 @@ def copy_columns_positional(src_wb, dst_wb, columns, header_row=1):
     return warnings
 
 
+def clean_product_name_style5(name):
+    """2단계 '5번시트' 그룹(오토/문정희 등)과 동일한 상품명 정리 규칙:
+    '<' 이후 전부 삭제 + 리터럴 'KC' 문자열만 제거 (KC 앞부분은 그대로 유지)."""
+    if not isinstance(name, str):
+        return name
+    name = re.sub(r'<.*', '', name)
+    name = name.replace('KC', '')
+    return name
+
+
+def build_moon_wb(wb_s):
+    """문정희 스냅샷용: wb_s(현재 상태)를 복제해 상품명 열에
+    2단계 문정희 로직(5번시트 스타일 정리 + '[상시의류]' 접두어)을 적용한 새 워크북 반환."""
+    moon_wb = load_wb(wb_bytes(wb_s), data_only=False)
+    ws = moon_wb.active
+
+    name_col = None
+    for cell in ws[1]:
+        if cell.value == '상품명':
+            name_col = cell.column
+            break
+    if name_col is None:
+        return moon_wb
+
+    for r in range(2, ws.max_row + 1):
+        cell = ws.cell(row=r, column=name_col)
+        if isinstance(cell.value, str):
+            cell.value = '[상시의류]' + clean_product_name_style5(cell.value)
+
+    return moon_wb
+
+
 def build_example_state(kirin_bytes, sfile_bytes):
     """기린.xlsx + S파일 -> (E,F,G 복사 → 곽충현/문정희 스냅샷 → AJ 복사) -> 예제 상태 bytes
 
-    반환: dict(예제_bytes, 곽충현_bytes, 문정희_초안_bytes, warnings)
+    문정희는 이 시점(E,F,G만 반영된 상태)의 상품명에 2단계 문정희 가공 규칙
+    ('<' 이후 삭제 + 'KC' 제거 + '[상시의류]' 접두어)을 적용해 최종본으로 생성합니다.
+    (곽충현은 아직 별도 가공 규칙이 없어 현재는 스냅샷 그대로 저장합니다.)
+
+    반환: dict(example_bytes, kwak_bytes, moon_bytes, warnings)
     """
     warnings = []
 
@@ -139,10 +175,9 @@ def build_example_state(kirin_bytes, sfile_bytes):
     # 1) E,F,G 열 복사
     warnings += copy_columns_positional(wb_kirin, wb_s, ['E', 'F', 'G'])
 
-    # 2) 이 시점 상태를 곽충현 / 문정희 이름으로 스냅샷 저장
-    #    (사용자 확인: 현재는 "이름만 바꿔서 저장"하는 방식 — 추후 각 파일 전용 가공 로직 추가 예정)
+    # 2) 이 시점 상태를 곽충현(스냅샷) / 문정희(가공본)로 저장
     kwak_bytes = wb_bytes(wb_s)
-    moon_draft_bytes = wb_bytes(wb_s)
+    moon_bytes = wb_bytes(build_moon_wb(wb_s))
 
     # 3) AJ 열 복사
     warnings += copy_columns_positional(wb_kirin, wb_s, ['AJ'])
@@ -153,7 +188,7 @@ def build_example_state(kirin_bytes, sfile_bytes):
     return {
         'example_bytes': example_bytes,
         'kwak_bytes': kwak_bytes,
-        'moon_draft_bytes': moon_draft_bytes,
+        'moon_bytes': moon_bytes,
         'warnings': warnings,
     }
 
@@ -471,10 +506,8 @@ def process_cafe24(dudu_bytes, today_str):
         df_choi[column_name] = df_choi[column_name].astype(str) + f' 26가을 {label}'
         outputs[f'{label}.xlsx'] = df_to_xlsx_bytes(df_choi, sheet_name="5번시트")
 
-    # 문정희.xlsx (2단계 최종본 - 1단계 초안과는 별도)
-    df_moon = df_sheet5.copy()
-    df_moon[column_name] = '[상시의류]' + df_moon[column_name].astype(str)
-    outputs['문정희.xlsx'] = df_to_xlsx_bytes(df_moon, sheet_name="5번시트")
+    # 문정희.xlsx는 1단계(build_example_state)에서 이미 최종본으로 생성되므로
+    # 2단계에서는 별도로 만들지 않습니다 (중복/덮어쓰기 방지).
 
     # 이모이모.xlsx
     df_sheet6 = df.copy()
@@ -591,10 +624,9 @@ SMARTSTORE_BLANK_HEADERS = [
 ]
 
 
-def convert_to_smartstore(x_bytes, template_bytes):
-    wb_src = load_wb(x_bytes, data_only=True)
-    ws_src = wb_src.active
-
+def _build_smartstore_rows(ws_src, row_numbers, template_bytes):
+    """ws_src의 지정된 행 번호(row_numbers, 1-based, ws_src 기준)들만 골라
+    스마트스토어 템플릿 한 장에 채워 넣은 워크북 bytes를 반환."""
     wb_template = load_wb(template_bytes, data_only=False)
     ws_template = wb_template.active
 
@@ -615,11 +647,7 @@ def convert_to_smartstore(x_bytes, template_bytes):
     final_defaults.update(template_default_values)
 
     current_row = 3
-    for i in range(2, ws_src.max_row + 1):
-        src_product_name = ws_src[f'H{i}'].value
-        if not src_product_name:
-            continue
-
+    for i in row_numbers:
         for col in range(1, ws_template.max_column + 1):
             ws_template.cell(row=current_row, column=col).value = None
 
@@ -660,7 +688,43 @@ def convert_to_smartstore(x_bytes, template_bytes):
     return wb_bytes(wb_template)
 
 
-def apply_category_mapping(df_dudu, outputs, n_bytes, mapping_df, target_col='스마트오토'):
+def convert_to_smartstore_chunks(x_bytes, template_bytes, chunk_size=500):
+    """X파일 -> 스마트스토어 템플릿 변환. 실제 데이터 행 수가 chunk_size(기본 500)를
+    초과하면 앞에서부터 chunk_size행씩 잘라 여러 개의 워크북으로 나눠 만듭니다.
+
+    반환: [{'start': 0-based 시작 인덱스, 'end': 끝(미포함) 인덱스, 'row_count': 행수, 'bytes': ...}, ...]
+    (start/end는 '유효 데이터 행'(상품명이 있는 행) 목록 기준 0-based 인덱스이며,
+    두두사사 DataFrame(df_dudu)의 행 순서와 1:1로 대응합니다.)
+    """
+    wb_src = load_wb(x_bytes, data_only=True)
+    ws_src = wb_src.active
+
+    valid_rows = [i for i in range(2, ws_src.max_row + 1) if ws_src.cell(row=i, column=get_col_index('H')).value]
+
+    if not valid_rows:
+        return []
+
+    chunks = []
+    for start in range(0, len(valid_rows), chunk_size):
+        row_numbers = valid_rows[start:start + chunk_size]
+        chunk_bytes = _build_smartstore_rows(ws_src, row_numbers, template_bytes)
+        chunks.append({
+            'start': start,
+            'end': start + len(row_numbers),
+            'row_count': len(row_numbers),
+            'bytes': chunk_bytes,
+        })
+
+    return chunks
+
+
+def apply_category_mapping(df_dudu, outputs, n_file_info, mapping_df, target_col='스마트오토'):
+    """마켓별 파일들의 E/F/G열, 그리고 N파일(들)의 B열(카테고리코드)에 카테고리 매핑을 적용.
+
+    n_file_info: [{'filename': ..., 'start': 0-based, 'end': 0-based(미포함)}, ...]
+    (N파일이 500행 단위로 여러 개로 쪼개져 있을 수 있으므로 각 청크의 start/end로
+    df_dudu의 올바른 행 구간을 찾아 매핑합니다.)
+    """
     warnings = []
     required_df_cols = ['상품분류 번호', '상품분류 신상품영역', '상품분류 추천상품영역']
     for col in required_df_cols:
@@ -699,40 +763,48 @@ def apply_category_mapping(df_dudu, outputs, n_bytes, mapping_df, target_col='�
 
         outputs[filename] = wb_bytes(wb)
 
-    if n_bytes is not None:
+    if n_file_info:
         if target_col not in mapping_df.columns:
             warnings.append(f"'{target_col}' 컬럼이 카테고리번호.xlsx에 없어 스마트스토어(N) 파일 매핑을 생략했습니다.")
         else:
             t_map = dict(zip(mapping_df['원본'].astype(str), mapping_df[target_col].astype(str)))
-            wb_n = load_wb(n_bytes, data_only=False)
-            ws_n = wb_n.active
-            for row in range(3, len(df_dudu) + 3):
-                raw_e = safe_str(df_dudu.loc[row - 3, '상품분류 번호'])
-                first_code = raw_e.split('|')[0].strip() if raw_e else ''
-                mapped_value = t_map.get(first_code, '')
-                ws_n[f'B{row}'] = mapped_value
-            n_bytes = wb_bytes(wb_n)
+            for info in n_file_info:
+                fname = info['filename']
+                if fname not in outputs:
+                    continue
+                wb_n = load_wb(outputs[fname], data_only=False)
+                ws_n = wb_n.active
+                chunk_len = info['end'] - info['start']
+                for local_row in range(chunk_len):
+                    df_idx = info['start'] + local_row
+                    raw_e = safe_str(df_dudu.loc[df_idx, '상품분류 번호'])
+                    first_code = raw_e.split('|')[0].strip() if raw_e else ''
+                    mapped_value = t_map.get(first_code, '')
+                    ws_n[f'B{local_row + 3}'] = mapped_value
+                outputs[fname] = wb_bytes(wb_n)
 
-    return outputs, n_bytes, warnings
+    return outputs, warnings
 
 
-def append_mapping_to_auto_file(outputs, n_bytes):
+def append_mapping_to_auto_file(outputs, n_file_info):
+    """N파일(들)의 B열(카테고리코드) 값을, N파일이 여러 청크로 나뉘어 있어도
+    전체 행 순서 그대로 이어붙여 오토.xlsx 상품명 뒤에 추가."""
     warnings = []
-    if n_bytes is None or '오토.xlsx' not in outputs:
+    if not n_file_info or '오토.xlsx' not in outputs:
         warnings.append("N파일 또는 오토.xlsx가 없어 오토 파일 상품명 매핑 추가를 건너뜀")
         return outputs, warnings
 
-    wb_n = load_wb(n_bytes, data_only=True)
-    ws_n = wb_n.active
-
     mappings = []
-    row = 3
-    while True:
-        value = ws_n[f'B{row}'].value
-        if value is None:
-            break
-        mappings.append(str(value))
-        row += 1
+    for info in n_file_info:
+        fname = info['filename']
+        if fname not in outputs:
+            continue
+        wb_n = load_wb(outputs[fname], data_only=True)
+        ws_n = wb_n.active
+        chunk_len = info['end'] - info['start']
+        for local_row in range(chunk_len):
+            value = ws_n[f'B{local_row + 3}'].value
+            mappings.append(str(value) if value is not None else '')
 
     wb_auto = load_wb(outputs['오토.xlsx'], data_only=False)
     ws_auto = wb_auto.active
@@ -787,8 +859,8 @@ def run_pipeline(
     """전체 파이프라인 실행.
 
     반환: {
-        'stage1': {파일명: bytes, ...},   # 예제/새기린/날짜파일/두두사사/다음S파일/카테고리번호/곽충현/문정희초안
-        'stage2': {파일명: bytes, ...},   # 19개 판매처 파일 + N파일
+        'stage1': {파일명: bytes, ...},   # 예제/새기린/날짜파일/두두사사/다음S파일/카테고리번호/곽충현/문정희
+        'stage2': {파일명: bytes, ...},   # 18개 판매처 파일(문정희 제외, 1단계에서 생성) + N파일(500행 초과 시 -1, -2...로 분할)
         'logs': [str, ...],
         'errors': [str, ...],
     }
@@ -832,7 +904,7 @@ def run_pipeline(
         f'S{next_s_str}.xlsx': next_sfile_bytes,
         '카테고리번호.xlsx': category_bytes_updated,
         '곽충현.xlsx': state['kwak_bytes'],
-        '문정희(초안).xlsx': state['moon_draft_bytes'],
+        '문정희.xlsx': state['moon_bytes'],
     }
 
     # 2단계 (자동업데이트파일생성 2026)
@@ -847,27 +919,36 @@ def run_pipeline(
         outputs, df_dudu, x_filename = process_cafe24(dudu_bytes, today_str)
         stage2.update(outputs)
 
-        n_bytes = None
+        n_file_info = []
         if template_bytes is not None:
             try:
-                n_filename = 'N' + x_filename[1:]
-                n_bytes = convert_to_smartstore(stage2[x_filename], template_bytes)
-                stage2[n_filename] = n_bytes
+                chunks = convert_to_smartstore_chunks(stage2[x_filename], template_bytes, chunk_size=500)
+                if len(chunks) == 1:
+                    fname = f'N{today_str}.xlsx'
+                    stage2[fname] = chunks[0]['bytes']
+                    n_file_info.append({'filename': fname, 'start': chunks[0]['start'], 'end': chunks[0]['end']})
+                elif len(chunks) > 1:
+                    for idx, c in enumerate(chunks, start=1):
+                        fname = f'N{today_str}-{idx}.xlsx'
+                        stage2[fname] = c['bytes']
+                        n_file_info.append({'filename': fname, 'start': c['start'], 'end': c['end']})
+                    total_rows = sum(c['row_count'] for c in chunks)
+                    logs.append(
+                        f"N파일 데이터가 총 {total_rows}행으로 500행을 초과해 "
+                        f"{len(chunks)}개 파일로 나눠 생성했습니다: {', '.join(i['filename'] for i in n_file_info)}"
+                    )
             except Exception as e:
                 errors.append(f"스마트스토어(N파일) 변환 중 오류: {e}")
         else:
             logs.append("스마트스토어기본.xlsx 템플릿이 제공되지 않아 N파일(스마트스토어 변환) 생성을 건너뛰었습니다.")
 
         if mapping_df is not None:
-            stage2, n_bytes, map_warnings = apply_category_mapping(
-                df_dudu, stage2, n_bytes, mapping_df, target_col=smartstore_target_col
+            stage2, map_warnings = apply_category_mapping(
+                df_dudu, stage2, n_file_info, mapping_df, target_col=smartstore_target_col
             )
             logs += map_warnings
-            if n_bytes is not None:
-                n_filename = 'N' + x_filename[1:]
-                stage2[n_filename] = n_bytes
 
-            stage2, auto_warnings = append_mapping_to_auto_file(stage2, n_bytes)
+            stage2, auto_warnings = append_mapping_to_auto_file(stage2, n_file_info)
             logs += auto_warnings
 
         stage2 = clear_columns(stage2, x_filename)
