@@ -71,8 +71,16 @@ def ensure_chromium_installed(status_cb: Optional[Callable[[str], None]] = None)
 
 
 def _close_popups(context, page):
-    """로그인 직후 뜨는 팝업(새 탭 또는 인페이지 모달)을 최대한 정리합니다.
-    실패해도 전체 흐름에 영향 주지 않도록 예외를 삼킵니다."""
+    """페이지 위에 남아있는 팝업(새 탭 또는 인페이지 모달)을 최대한 정리합니다.
+    실패해도 전체 흐름에 영향 주지 않도록 예외를 삼킵니다.
+
+    로그인 직후뿐 아니라, 업로드 화면 진입 직후 / 파일 첨부 후 업로드 버튼을 누르기
+    직전에도 호출합니다 — 예를 들어 "전용 엑셀양식 다운로드" 같은 안내 팝업이 업로드
+    화면에서 새로 뜨면서 업로드 버튼을 가려 클릭이 안 먹히는 경우가 실제로 있었기
+    때문입니다(실사용 테스트 중 발견 — 클릭이 막혀도 조용히 넘어가면 실제로는 아무
+    것도 업로드되지 않았는데 "성공"으로 잘못 표시되는 문제가 있어, 이제는 클릭 자체가
+    끝까지 실패하면 성공으로 처리하지 않고 오류로 보고합니다. 아래 upload_one_account
+    참고)."""
     time.sleep(1)
     for p in list(context.pages):
         if p is not page:
@@ -82,6 +90,7 @@ def _close_popups(context, page):
                 pass
 
     close_selectors = [
+        "button:has-text('확인')",
         "button:has-text('닫기')",
         "[aria-label='닫기']",
         "[aria-label='close']",
@@ -97,6 +106,34 @@ def _close_popups(context, page):
                 time.sleep(0.3)
         except Exception:
             continue
+
+    try:
+        page.keyboard.press("Escape")
+    except Exception:
+        pass
+
+
+def _visible_popup_text(page):
+    """현재 화면에 남아있는 팝업/모달로 보이는 요소가 있으면 그 텍스트 일부를 반환합니다
+    (진단 메시지용, 최선 노력 — 실패하거나 못 찾으면 빈 문자열)."""
+    selectors = [
+        "[role='dialog']",
+        ".layer_popup",
+        ".pop_layer",
+        ".popup",
+        ".modal",
+    ]
+    for sel in selectors:
+        try:
+            loc = page.locator(sel).first
+            if loc.count() > 0 and loc.is_visible(timeout=300):
+                text = loc.inner_text(timeout=500)
+                text = " ".join(text.split())
+                if text:
+                    return text[:200]
+        except Exception:
+            continue
+    return ""
 
 
 def upload_one_account(playwright, name, cafe24_id, cafe24_pw, file_bytes, file_name,
@@ -140,6 +177,10 @@ def upload_one_account(playwright, name, cafe24_id, cafe24_pw, file_bytes, file_
         upload_url = base_url.rstrip("/") + UPLOAD_PATH
         page.goto(upload_url, wait_until="domcontentloaded", timeout=nav_timeout_ms)
 
+        # 업로드 화면에 진입한 직후에도 안내 팝업(예: "전용 엑셀양식 다운로드")이 새로
+        # 뜨는 경우가 있어, 파일을 첨부하기 전에 한 번 더 정리합니다.
+        _close_popups(context, page)
+
         temp_path = f"/tmp/_cafe24_upload_{name}_{os.getpid()}.xlsx"
         with open(temp_path, "wb") as f:
             f.write(file_bytes)
@@ -175,10 +216,33 @@ def upload_one_account(playwright, name, cafe24_id, cafe24_pw, file_bytes, file_
                 screenshot=shot,
             )
 
-        try:
-            page.locator(UPLOAD_BTN_XPATH).click(timeout=5000)
-        except Exception:
-            pass
+        # 파일 첨부 후 새로 뜬 팝업이 업로드 버튼을 가릴 수 있어 한 번 더 정리한 뒤
+        # 클릭합니다. 클릭 자체가 끝까지 실패하면(예: 팝업에 가려져 클릭이 막히는 경우)
+        # 예외를 조용히 무시하고 넘어가지 않습니다 — 그렇게 하면 실제로는 업로드 버튼이
+        # 눌리지 않았는데도 "성공"으로 잘못 표시되는 문제가 실사용 중 확인됐습니다.
+        # 대신 팝업 정리 후 한 번 더 재시도하고, 그래도 안 되면 오류로 명확히 보고합니다
+        # (재시도는 이 클릭 단계 안에서만이며, 계정 자체를 다시 시도하지는 않습니다).
+        click_error = None
+        for attempt in range(2):
+            try:
+                page.locator(UPLOAD_BTN_XPATH).click(timeout=5000)
+                click_error = None
+                break
+            except Exception as e:
+                click_error = e
+                _close_popups(context, page)
+                time.sleep(0.5)
+
+        if click_error is not None:
+            popup_text = _visible_popup_text(page)
+            shot = _safe_screenshot(page)
+            msg = "업로드 버튼을 클릭하지 못했습니다"
+            if popup_text:
+                msg += f" (화면에 남은 팝업으로 보임: \"{popup_text}\")"
+            else:
+                msg += f" ({click_error})"
+            msg += " — 이 계정은 재시도하지 않았습니다. 스크린샷을 확인해주세요."
+            return AccountResult(name=name, status="error", message=msg, screenshot=shot)
 
         time.sleep(post_delay_sec)
 
