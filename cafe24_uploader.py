@@ -138,9 +138,15 @@ def _visible_popup_text(page):
 
 
 def upload_one_account(playwright, name, cafe24_id, cafe24_pw, file_bytes, file_name,
-                        headless=True, post_delay_sec=3, nav_timeout_ms=25000):
+                        headless=True, post_delay_sec=3, nav_timeout_ms=25000,
+                        debug_pause=False):
     """단일 계정으로 로그인 -> 업로드 화면 이동 -> 파일 업로드 시도.
-    실패해도 예외를 던지지 않고 AccountResult로 결과를 반환합니다(재시도하지 않음)."""
+    실패해도 예외를 던지지 않고 AccountResult로 결과를 반환합니다(재시도하지 않음).
+
+    debug_pause=True이면(그리고 headless=False일 때만) 업로드 화면에 진입한 직후,
+    자동 팝업 정리를 하기 전에 Playwright 인스펙터로 실행을 멈춥니다 — 화면에 남은
+    팝업/버튼의 정확한 선택자를 직접 확인하고 싶을 때 사용합니다. headless=True인
+    경우에는 볼 화면이 없어 무한 대기하게 되므로 이 옵션을 무시합니다."""
     browser = None
     page = None
     try:
@@ -177,6 +183,16 @@ def upload_one_account(playwright, name, cafe24_id, cafe24_pw, file_bytes, file_
 
         upload_url = base_url.rstrip("/") + UPLOAD_PATH
         page.goto(upload_url, wait_until="domcontentloaded", timeout=nav_timeout_ms)
+
+        if debug_pause and not headless:
+            # 여기서 멈춥니다 — 업로드 화면에 막 진입한 상태 그대로(팝업이 떠 있다면
+            # 그 팝업도 건드리지 않은 상태)이며, 아래 자동 팝업 정리(_close_popups)는
+            # 아직 실행되지 않았습니다. Playwright 인스펙터(별도 창)의 '재생' 버튼을
+            # 누르기 전까지는 그대로 대기합니다.
+            try:
+                page.pause()
+            except Exception:
+                pass
 
         # 업로드 화면에 진입한 직후에도 안내 팝업(예: "전용 엑셀양식 다운로드")이 새로
         # 뜨는 경우가 있어, 파일을 첨부하기 전에 한 번 더 정리합니다.
@@ -301,10 +317,13 @@ def _ensure_windows_subprocess_event_loop():
         pass
 
 
-def run_batch_upload(accounts, headless=True, post_delay_sec=3, progress_cb=None) -> List[AccountResult]:
+def run_batch_upload(accounts, headless=True, post_delay_sec=3, progress_cb=None,
+                      debug_pause=False) -> List[AccountResult]:
     """
     accounts: [{'name':.., 'id':.., 'password':.., 'file_bytes':.., 'file_name':..}, ...]
     progress_cb: 선택. callable(index, total, AccountResult) — 진행 상황 콜백(Streamlit 갱신용)
+    debug_pause: 선택. True면 각 계정의 업로드 화면 진입 직후 자동 진행을 멈춥니다
+        (headless=False일 때만 의미가 있습니다 — upload_one_account 참고).
     반환: AccountResult 리스트 (accounts와 같은 순서)
     """
     _ensure_windows_subprocess_event_loop()
@@ -316,6 +335,7 @@ def run_batch_upload(accounts, headless=True, post_delay_sec=3, progress_cb=None
                 p, acc["name"], acc["id"], acc["password"],
                 acc["file_bytes"], acc["file_name"],
                 headless=headless, post_delay_sec=post_delay_sec,
+                debug_pause=debug_pause,
             )
             results.append(result)
             if progress_cb:
