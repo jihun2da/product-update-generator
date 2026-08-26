@@ -357,6 +357,17 @@ headless = st.checkbox(
     help="Streamlit Cloud 등 서버 환경에서는 반드시 체크된 상태로 사용해야 합니다. "
     "내 컴퓨터에서 직접 실행하며 브라우저 동작을 눈으로 보고 싶을 때만 해제하세요.",
 )
+debug_pause = st.checkbox(
+    "디버그: 업로드 화면 진입 직후 자동 진행 멈추기 (선택자 확인용)",
+    value=False,
+    disabled=headless,
+    help="체크하면 업로드 화면에 들어간 직후(팝업 자동 정리·파일 첨부 전) 자동화가 "
+    "멈추고 Playwright 인스펙터 창이 뜹니다. 그 상태에서 브라우저 화면의 팝업이나 "
+    "버튼을 개발자도구(F12)로 검사해 정확한 선택자(class, id, xpath 등)를 확인한 뒤, "
+    "인스펙터의 '재생(▶ Resume)' 버튼을 눌러야 이어서 진행됩니다. "
+    "'브라우저 화면 없이 실행(headless)'이 체크된 상태에서는 볼 화면이 없어 "
+    "사용할 수 없습니다(자동으로 비활성화됩니다).",
+)
 post_delay = st.number_input("계정별 업로드 버튼 클릭 후 대기 시간(초)", min_value=1, value=3, step=1)
 
 start_clicked = st.button(
@@ -379,9 +390,15 @@ if start_clicked:
         progress_bar.progress(i / total)
         status_area.write(f"[{i}/{total}] {result.name} → {result.status}")
 
-    with st.spinner(f"{len(matched)}개 계정 업로드 진행 중... (계정당 처리 시간이 있어 시간이 걸릴 수 있습니다)"):
+    debug_pause_active = debug_pause and not headless
+    spinner_msg = f"{len(matched)}개 계정 업로드 진행 중... (계정당 처리 시간이 있어 시간이 걸릴 수 있습니다)"
+    if debug_pause_active:
+        spinner_msg += " — 디버그 모드: 업로드 화면 진입 시 Playwright 인스펙터에서 '재생'을 누를 때까지 멈춰 있습니다."
+
+    with st.spinner(spinner_msg):
         results = up.run_batch_upload(
-            matched, headless=headless, post_delay_sec=int(post_delay), progress_cb=progress_cb
+            matched, headless=headless, post_delay_sec=int(post_delay), progress_cb=progress_cb,
+            debug_pause=debug_pause_active,
         )
 
     st.session_state["cafe24_last_results"] = results
