@@ -50,6 +50,14 @@ st.warning(
 # 1) Secrets에서 계정 목록 불러오기
 # ---------------------------------------------------------------------------
 def load_accounts():
+    """Secrets에서 계정 목록을 읽어옵니다.
+
+    각 계정은 Secrets 안에서 고유한 키(예: "모나마켓", 또는 같은 이름이 여러 개면
+    "모나마켓_2", "모나마켓_3"...)를 가져야 하지만, 실제로 업로드할 때 어떤 파일과
+    매칭시킬지는 별도의 "file" 값으로 관리합니다(생략하면 계정 키 자체를 사용).
+    이렇게 분리해두면, 아이디/비밀번호는 다르지만 같은 파일을 올려야 하는 계정
+    여러 개를 "이름이 같다"는 이유로 1개만 남기고 지우지 않고 전부 등록할 수 있습니다.
+    """
     try:
         cafe24_conf = st.secrets.get("cafe24")
     except Exception:
@@ -67,7 +75,15 @@ def load_accounts():
     result = {}
     for name, info in accounts_conf.items():
         try:
-            result[name] = {"id": info["id"], "password": info["password"]}
+            file_key = None
+            try:
+                file_key = info.get("file")
+            except Exception:
+                file_key = None
+            file_key = str(file_key).strip() if file_key else ""
+            if not file_key:
+                file_key = name
+            result[name] = {"id": info["id"], "password": info["password"], "file": file_key}
         except Exception:
             continue
     return result
@@ -82,6 +98,13 @@ with st.expander("① Secrets 등록 도우미 (아이디비번.xlsx → Secrets
         "엑셀을 올리면, Secrets에 붙여넣을 텍스트를 만들어서 **파일로만** 내려드립니다 "
         "(화면에 실제 아이디/비밀번호는 표시하지 않습니다)."
     )
+    st.caption(
+        "💡 서로 다른 아이디인데 **같은 파일을 업로드해야 하는 계정이 여러 개**라면 "
+        "'이름' 컬럼에 같은 이름을 그대로 여러 번 써서 올려도 됩니다 — 더 이상 중복으로 "
+        "취급해 1개만 남기지 않고, 전부 별도 계정으로 등록하면서 같은 파일과 매칭되도록 "
+        "처리합니다. 필요하면 '파일명' 컬럼을 추가해서, 실제 업로드할 파일 이름을 "
+        "'이름'과 다르게 직접 지정할 수도 있습니다(선택 사항)."
+    )
     cred_file = st.file_uploader("이름/아이디/비밀번호 컬럼이 있는 엑셀 업로드", type=["xlsx"], key="cred_xlsx")
 
     def _find_col_map(columns):
@@ -94,6 +117,8 @@ with st.expander("① Secrets 등록 도우미 (아이디비번.xlsx → Secrets
                 col_map["id"] = col
             elif c in ("비밀번호", "비번", "PW", "pw", "password", "Password"):
                 col_map["pw"] = col
+            elif c in ("파일명", "파일", "업로드파일명", "file", "File"):
+                col_map["file"] = col
         return col_map
 
     if cred_file is not None:
@@ -127,55 +152,65 @@ with st.expander("① Secrets 등록 도우미 (아이디비번.xlsx → Secrets
                 f"확인한 시트/컬럼: {detail}"
             )
         else:
-                # 이름 기준으로 마지막 값이 이기도록 먼저 dict로 정리합니다.
-                # (TOML은 같은 테이블을 두 번 선언하는 것 자체가 오류라서, 중복 이름을
-                #  그대로 두면 Secrets 텍스트 전체가 파싱 실패로 깨집니다 — 반드시 이름당
-                #  1개 블록만 생성해야 합니다.)
-                order = []
-                seen = {}
-                dup_names = []
+                # 같은 '이름'이 여러 행에 있어도 더 이상 실수로 생긴 중복으로 취급해
+                # 지우지 않습니다(예: 서로 다른 아이디인데 같은 파일을 올려야 하는 계정이
+                # 여러 개인 경우). 대신 Secrets 안에서 키가 겹치면 안 되므로(TOML은 같은
+                # 테이블을 두 번 선언하면 오류), 이름이 반복되는 행에는 뒤에 _2, _3 ...을
+                # 붙여 고유한 "Secrets 키"를 자동으로 만들어줍니다. 실제 업로드할 파일과
+                # 매칭할 때 쓰는 값("파일명")은 원래 이름(또는 '파일명' 컬럼이 있으면 그 값)을
+                # 그대로 유지하므로, 이름이 같은 계정들은 모두 같은 파일과 매칭됩니다.
+                name_seen_count = {}
+                rows = []  # (secrets_key, id, pw, file_key, original_name)
                 for _, r in df.iterrows():
                     name = str(r[col_map["name"]]).strip()
                     id_ = str(r[col_map["id"]]).strip()
                     pw = str(r[col_map["pw"]]).strip()
+                    file_key = ""
+                    if "file" in col_map:
+                        file_key = str(r[col_map["file"]]).strip()
+                    if not file_key:
+                        file_key = name
                     if not name or not id_ or not pw:
                         continue
-                    if name in seen:
-                        dup_names.append(name)
-                    else:
-                        order.append(name)
-                    seen[name] = (id_, pw)
+                    name_seen_count[name] = name_seen_count.get(name, 0) + 1
+                    n = name_seen_count[name]
+                    secrets_key = name if n == 1 else f"{name}_{n}"
+                    rows.append((secrets_key, id_, pw, file_key, name))
 
-                rows = [(name, seen[name][0], seen[name][1]) for name in order]
+                dup_names = sorted({name for name, cnt in name_seen_count.items() if cnt > 1})
 
-                # 미리보기는 이름만 보여주고 아이디/비밀번호는 마스킹 처리
+                # 미리보기는 이름/키/매칭용 파일명만 보여주고 아이디/비밀번호는 마스킹 처리
                 preview_df = pd.DataFrame(
                     {
-                        "이름": [n for n, _, _ in rows],
-                        "아이디": ["*" * len(i) for _, i, _ in rows],
-                        "비밀번호": ["*" * len(p) for _, _, p in rows],
+                        "Secrets 키": [k for k, _, _, _, _ in rows],
+                        "매칭용 파일명": [fk for _, _, _, fk, _ in rows],
+                        "아이디": ["*" * len(i) for _, i, _, _, _ in rows],
+                        "비밀번호": ["*" * len(p) for _, _, p, _, _ in rows],
                     }
                 )
                 st.dataframe(preview_df, use_container_width=True, hide_index=True)
 
                 if dup_names:
-                    st.warning(
-                        "⚠️ 아래 이름이 엑셀에 중복으로 있습니다. Secrets는 이름별로 1개씩만 "
-                        "저장되므로, 같은 이름 중 **엑셀에서 가장 마지막에 나온 행의 아이디/비밀번호만** "
-                        f"사용됩니다: {sorted(set(dup_names))}"
+                    st.info(
+                        "ℹ️ 아래 이름은 엑셀에 여러 번 나와서, Secrets 키를 이름_2, 이름_3 ... "
+                        "형태로 자동으로 구분해 **모두 별도 계정으로 등록**했습니다. 매칭용 "
+                        "파일명은 원래 이름 그대로이므로, 업로드 시 같은 파일이 이 계정들 "
+                        f"전체에 업로드됩니다(의도한 경우가 아니면 확인해주세요): {dup_names}"
                     )
 
                 if not rows:
                     st.error("사용 가능한 행이 없습니다 (이름/아이디/비밀번호 중 빈 값이 있는 행은 제외됩니다).")
                 else:
                     toml_lines = []
-                    for name, id_, pw in rows:
-                        esc_name = name.replace("\\", "\\\\").replace('"', '\\"')
+                    for secrets_key, id_, pw, file_key, _orig_name in rows:
+                        esc_key = secrets_key.replace("\\", "\\\\").replace('"', '\\"')
                         esc_id = id_.replace("\\", "\\\\").replace('"', '\\"')
                         esc_pw = pw.replace("\\", "\\\\").replace('"', '\\"')
-                        toml_lines.append(f'[cafe24.accounts."{esc_name}"]')
+                        esc_file = file_key.replace("\\", "\\\\").replace('"', '\\"')
+                        toml_lines.append(f'[cafe24.accounts."{esc_key}"]')
                         toml_lines.append(f'id = "{esc_id}"')
                         toml_lines.append(f'password = "{esc_pw}"')
+                        toml_lines.append(f'file = "{esc_file}"')
                         toml_lines.append("")
                     toml_text = "\n".join(toml_lines)
 
@@ -194,9 +229,13 @@ with st.expander("① Secrets 등록 도우미 (아이디비번.xlsx → Secrets
 st.divider()
 
 # ---------------------------------------------------------------------------
-# 2) 업로드할 파일 선택 (파일명 = 계정 이름과 일치해야 매칭됨. 단, 파일명이
-#    "X20260820"처럼 뒤에 날짜(YYYYMMDD)가 붙어 매일 바뀌는 경우에는, 그 날짜를
-#    뺀 나머지("X")가 계정 이름과 같으면 자동으로 매칭됩니다.)
+# 2) 업로드할 파일 선택
+#    파일명이 계정의 "매칭용 파일명"(기본값 = 계정 이름, '①'에서 '파일명' 컬럼으로
+#    직접 지정도 가능)과 같아야 매칭됩니다. 계정 이름은 서로 달라도(같은 이름을 여러
+#    계정이 공유해도) 매칭용 파일명이 같으면, 그 계정 전부가 같은 파일로 매칭됩니다
+#    (아이디는 다른데 같은 파일을 올려야 하는 경우). 또한 파일명이 "X20260820"처럼
+#    뒤에 날짜(YYYYMMDD)가 붙어 매일 바뀌는 경우에는, 그 날짜를 뺀 나머지("X")가
+#    매칭용 파일명과 같으면 자동으로 매칭됩니다.
 # ---------------------------------------------------------------------------
 st.subheader("② 업로드할 판매처 파일 선택")
 
@@ -210,13 +249,15 @@ else:
 
 st.caption(
     "💡 파일명이 'X20260820.xlsx'처럼 뒤에 날짜(8자리, 매일 바뀜)가 붙는 경우에는, "
-    "Secrets에 계정 이름을 날짜 없이 'X'로 등록해두면 날짜가 몇 월 며칠로 바뀌어도 "
-    "자동으로 매칭됩니다 (앞부분 'X'만 같으면 됨)."
+    "Secrets에 계정의 매칭용 파일명을 날짜 없이 'X'로 등록해두면 날짜가 몇 월 며칠로 "
+    "바뀌어도 자동으로 매칭됩니다 (앞부분 'X'만 같으면 됨). 아이디는 다른데 같은 파일을 "
+    "올려야 하는 계정이 여러 개라면, '①'에서 이름을 같게 등록해두면 그 계정 전부가 "
+    "같은 파일과 자동으로 매칭됩니다."
 )
 
 uploaded_files = st.file_uploader(
-    "판매처별 결과 파일들을 올려주세요 (파일명이 Secrets에 등록된 계정 이름과 같아야 자동 매칭됩니다. "
-    "예: 김하늘.xlsx / 날짜가 붙는 파일은 X20260820.xlsx 같은 형태도 가능)",
+    "판매처별 결과 파일들을 올려주세요 (파일명이 Secrets에 등록된 계정의 매칭용 파일명과 같아야 "
+    "자동 매칭됩니다. 예: 김하늘.xlsx / 날짜가 붙는 파일은 X20260820.xlsx 같은 형태도 가능)",
     type=["xlsx"],
     accept_multiple_files=True,
 )
@@ -226,45 +267,58 @@ unmatched_names = []
 pattern_matched_notes = []
 
 if uploaded_files:
-    # 정규화된(날짜 제거) 이름 -> [계정 이름, ...] 매핑. 날짜가 없는 일반 계정 이름은
-    # 정규화해도 그대로이므로, 이 맵에는 모든 계정이 자기 자신의 정규화 키로도 들어갑니다.
-    normalized_accounts = {}
-    for acc_name in accounts:
-        key = _normalize_for_match(acc_name)
-        normalized_accounts.setdefault(key, []).append(acc_name)
+    # 매칭용 파일명(accounts[key]["file"]) -> [계정 키, ...] 매핑. 이름이 같은 계정이
+    # 여러 개면(아이디는 다르지만 같은 파일을 올려야 하는 경우) 한 파일명 아래에 계정
+    # 키가 여러 개 모입니다.
+    file_key_to_accounts = {}
+    for acc_key, info in accounts.items():
+        file_key_to_accounts.setdefault(info["file"], []).append(acc_key)
+
+    # 정규화된(날짜 제거) 파일명 -> {원본 파일명 -> [계정 키, ...]}. 서로 다른 원본
+    # 파일명이 같은 정규화 값으로 겹치면(예: "X20260101"과 "X"가 둘 다 등록된 경우)
+    # 어느 쪽 계정 목록을 써야 할지 알 수 없으므로 모호한 경우로 취급합니다.
+    normalized_index = {}
+    for file_key, acc_list in file_key_to_accounts.items():
+        norm = _normalize_for_match(file_key)
+        normalized_index.setdefault(norm, {})[file_key] = acc_list
 
     for f in uploaded_files:
         stem = Path(f.name).stem.strip()
-        matched_account_name = None
+        matched_account_keys = []
+        via_pattern = False
 
-        if stem in accounts:
-            # 파일명이 계정 이름과 정확히 같은 경우 (기존 방식)
-            matched_account_name = stem
+        if stem in file_key_to_accounts:
+            # 파일명이 계정의 매칭용 파일명과 정확히 같은 경우 (기존 방식)
+            matched_account_keys = file_key_to_accounts[stem]
         else:
-            # 정확히 일치하는 계정이 없으면, 뒤에 붙은 8자리 날짜를 뗀 값으로 다시 시도
+            # 정확히 일치하는 파일명이 없으면, 뒤에 붙은 8자리 날짜를 뗀 값으로 다시 시도
             norm_stem = _normalize_for_match(stem)
-            candidates = normalized_accounts.get(norm_stem, [])
-            if len(candidates) == 1:
-                matched_account_name = candidates[0]
-                if norm_stem != stem:
-                    pattern_matched_notes.append(f"{f.name} → '{matched_account_name}' 계정 (날짜 패턴 매칭)")
-            elif len(candidates) > 1:
+            group = normalized_index.get(norm_stem, {})
+            if len(group) == 1:
+                (only_file_key, acc_list), = group.items()
+                matched_account_keys = acc_list
+                via_pattern = True
+            elif len(group) > 1:
                 unmatched_names.append(
-                    f"{f.name} (날짜를 뗀 이름 '{norm_stem}'이 여러 계정과 동시에 일치: {candidates} — "
-                    "계정 이름을 더 구체적으로 등록해주세요)"
+                    f"{f.name} (날짜를 뗀 이름 '{norm_stem}'이 서로 다른 파일명 여러 개와 동시에 "
+                    f"일치: {sorted(group.keys())} — 매칭용 파일명을 더 구체적으로 등록해주세요)"
                 )
                 continue
 
-        if matched_account_name:
-            matched.append(
-                {
-                    "name": matched_account_name,
-                    "id": accounts[matched_account_name]["id"],
-                    "password": accounts[matched_account_name]["password"],
-                    "file_bytes": f.read(),
-                    "file_name": f.name,
-                }
-            )
+        if matched_account_keys:
+            file_bytes = f.read()
+            for acc_key in matched_account_keys:
+                matched.append(
+                    {
+                        "name": acc_key,
+                        "id": accounts[acc_key]["id"],
+                        "password": accounts[acc_key]["password"],
+                        "file_bytes": file_bytes,
+                        "file_name": f.name,
+                    }
+                )
+            if via_pattern:
+                pattern_matched_notes.append(f"{f.name} → {', '.join(matched_account_keys)} (날짜 패턴 매칭)")
         else:
             unmatched_names.append(f.name)
 
@@ -275,6 +329,8 @@ if uploaded_files:
 
     # 같은 계정으로 파일이 2개 이상 매칭되면(예: X20260820.xlsx, X20260821.xlsx를 실수로
     # 같이 올린 경우) 같은 계정에 연속으로 두 번 업로드가 실행되니 미리 알려줍니다.
+    # (이름이 같은 서로 다른 계정 여러 개가 같은 파일 하나에 매칭되는 것은 정상 동작이라
+    # 여기 해당하지 않습니다 — 계정 키 자체가 반복될 때만 경고합니다.)
     account_counts = {}
     for m in matched:
         account_counts[m["name"]] = account_counts.get(m["name"], 0) + 1
@@ -287,8 +343,8 @@ if uploaded_files:
 
     if unmatched_names:
         st.warning(
-            "⚠️ 아래 파일은 이름이 Secrets에 등록된 계정과 일치하지 않아 업로드 대상에서 "
-            f"제외됩니다: {unmatched_names}"
+            "⚠️ 아래 파일은 매칭용 파일명이 Secrets에 등록된 계정과 일치하지 않아 업로드 "
+            f"대상에서 제외됩니다: {unmatched_names}"
         )
 
 st.divider()
