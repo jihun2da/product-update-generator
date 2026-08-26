@@ -10,6 +10,7 @@
 """
 
 import io
+import re
 import zipfile
 from pathlib import Path
 
@@ -17,6 +18,17 @@ import pandas as pd
 import streamlit as st
 
 import cafe24_uploader as up
+
+# 파일명 끝이 8자리 날짜(YYYYMMDD)로 끝나는 경우, 그 날짜 부분을 떼어내고 비교하기 위한 패턴.
+# 예: "X20260820" -> "X", "김하늘" -> "김하늘"(날짜가 없으면 그대로).
+# 이렇게 하면 매일 파일명 뒤의 날짜가 바뀌어도(X20260820.xlsx, X20260821.xlsx, ...),
+# Secrets에 등록된 계정 이름이 "X"(또는 날짜가 포함된 이름 아무거나)이기만 하면
+# 앞부분("X")이 같은 파일과 자동으로 매칭됩니다.
+_DATE_SUFFIX_RE = re.compile(r"\d{8}$")
+
+
+def _normalize_for_match(name: str) -> str:
+    return _DATE_SUFFIX_RE.sub("", name.strip())
 
 st.set_page_config(page_title="카페24 자동 업로드", layout="wide")
 
@@ -182,7 +194,9 @@ with st.expander("① Secrets 등록 도우미 (아이디비번.xlsx → Secrets
 st.divider()
 
 # ---------------------------------------------------------------------------
-# 2) 업로드할 파일 선택 (파일명 = 계정 이름과 일치해야 매칭됨)
+# 2) 업로드할 파일 선택 (파일명 = 계정 이름과 일치해야 매칭됨. 단, 파일명이
+#    "X20260820"처럼 뒤에 날짜(YYYYMMDD)가 붙어 매일 바뀌는 경우에는, 그 날짜를
+#    뺀 나머지("X")가 계정 이름과 같으면 자동으로 매칭됩니다.)
 # ---------------------------------------------------------------------------
 st.subheader("② 업로드할 판매처 파일 선택")
 
@@ -194,24 +208,59 @@ if not accounts:
 else:
     st.caption(f"현재 Secrets에 등록된 계정 수: {len(accounts)}개 ({', '.join(sorted(accounts.keys()))})")
 
+st.caption(
+    "💡 파일명이 'X20260820.xlsx'처럼 뒤에 날짜(8자리, 매일 바뀜)가 붙는 경우에는, "
+    "Secrets에 계정 이름을 날짜 없이 'X'로 등록해두면 날짜가 몇 월 며칠로 바뀌어도 "
+    "자동으로 매칭됩니다 (앞부분 'X'만 같으면 됨)."
+)
+
 uploaded_files = st.file_uploader(
-    "판매처별 결과 파일들을 올려주세요 (파일명이 Secrets에 등록된 계정 이름과 같아야 자동 매칭됩니다. 예: 김하늘.xlsx)",
+    "판매처별 결과 파일들을 올려주세요 (파일명이 Secrets에 등록된 계정 이름과 같아야 자동 매칭됩니다. "
+    "예: 김하늘.xlsx / 날짜가 붙는 파일은 X20260820.xlsx 같은 형태도 가능)",
     type=["xlsx"],
     accept_multiple_files=True,
 )
 
 matched = []
 unmatched_names = []
+pattern_matched_notes = []
 
 if uploaded_files:
+    # 정규화된(날짜 제거) 이름 -> [계정 이름, ...] 매핑. 날짜가 없는 일반 계정 이름은
+    # 정규화해도 그대로이므로, 이 맵에는 모든 계정이 자기 자신의 정규화 키로도 들어갑니다.
+    normalized_accounts = {}
+    for acc_name in accounts:
+        key = _normalize_for_match(acc_name)
+        normalized_accounts.setdefault(key, []).append(acc_name)
+
     for f in uploaded_files:
         stem = Path(f.name).stem.strip()
+        matched_account_name = None
+
         if stem in accounts:
+            # 파일명이 계정 이름과 정확히 같은 경우 (기존 방식)
+            matched_account_name = stem
+        else:
+            # 정확히 일치하는 계정이 없으면, 뒤에 붙은 8자리 날짜를 뗀 값으로 다시 시도
+            norm_stem = _normalize_for_match(stem)
+            candidates = normalized_accounts.get(norm_stem, [])
+            if len(candidates) == 1:
+                matched_account_name = candidates[0]
+                if norm_stem != stem:
+                    pattern_matched_notes.append(f"{f.name} → '{matched_account_name}' 계정 (날짜 패턴 매칭)")
+            elif len(candidates) > 1:
+                unmatched_names.append(
+                    f"{f.name} (날짜를 뗀 이름 '{norm_stem}'이 여러 계정과 동시에 일치: {candidates} — "
+                    "계정 이름을 더 구체적으로 등록해주세요)"
+                )
+                continue
+
+        if matched_account_name:
             matched.append(
                 {
-                    "name": stem,
-                    "id": accounts[stem]["id"],
-                    "password": accounts[stem]["password"],
+                    "name": matched_account_name,
+                    "id": accounts[matched_account_name]["id"],
+                    "password": accounts[matched_account_name]["password"],
                     "file_bytes": f.read(),
                     "file_name": f.name,
                 }
@@ -221,6 +270,21 @@ if uploaded_files:
 
     if matched:
         st.success(f"매칭된 계정 {len(matched)}개: {', '.join(m['name'] for m in matched)}")
+    if pattern_matched_notes:
+        st.info("📅 날짜 패턴으로 매칭된 파일:\n" + "\n".join(f"- {n}" for n in pattern_matched_notes))
+
+    # 같은 계정으로 파일이 2개 이상 매칭되면(예: X20260820.xlsx, X20260821.xlsx를 실수로
+    # 같이 올린 경우) 같은 계정에 연속으로 두 번 업로드가 실행되니 미리 알려줍니다.
+    account_counts = {}
+    for m in matched:
+        account_counts[m["name"]] = account_counts.get(m["name"], 0) + 1
+    dup_account_matches = {name: cnt for name, cnt in account_counts.items() if cnt > 1}
+    if dup_account_matches:
+        st.warning(
+            "⚠️ 아래 계정은 파일이 2개 이상 매칭되어, 같은 계정으로 여러 번 업로드가 "
+            f"진행됩니다(의도한 경우가 아니면 파일을 확인해주세요): {dup_account_matches}"
+        )
+
     if unmatched_names:
         st.warning(
             "⚠️ 아래 파일은 이름이 Secrets에 등록된 계정과 일치하지 않아 업로드 대상에서 "
