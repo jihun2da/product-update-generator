@@ -72,30 +72,49 @@ with st.expander("① Secrets 등록 도우미 (아이디비번.xlsx → Secrets
     )
     cred_file = st.file_uploader("이름/아이디/비밀번호 컬럼이 있는 엑셀 업로드", type=["xlsx"], key="cred_xlsx")
 
+    def _find_col_map(columns):
+        col_map = {}
+        for col in columns:
+            c = str(col).strip()
+            if c in ("이름", "성함", "name", "Name"):
+                col_map["name"] = col
+            elif c in ("아이디", "ID", "id", "Id"):
+                col_map["id"] = col
+            elif c in ("비밀번호", "비번", "PW", "pw", "password", "Password"):
+                col_map["pw"] = col
+        return col_map
+
     if cred_file is not None:
+        # 엑셀 파일에 시트가 여러 개일 수 있습니다(예: 상품 템플릿 시트 + 계정 목록 시트가
+        # 한 파일 안에 같이 저장된 경우). pandas는 시트를 지정하지 않으면 첫 번째 시트만
+        # 읽으므로, 이름/아이디/비밀번호 컬럼이 있는 시트를 찾을 때까지 모든 시트를
+        # 순서대로 확인합니다.
+        df = None
+        col_map = {}
+        checked_sheets = []
         try:
-            df = pd.read_excel(cred_file, dtype=str).fillna("")
+            xls = pd.ExcelFile(cred_file)
+            for sheet_name in xls.sheet_names:
+                sheet_df = pd.read_excel(xls, sheet_name=sheet_name, dtype=str).fillna("")
+                found = _find_col_map(sheet_df.columns)
+                checked_sheets.append((sheet_name, list(sheet_df.columns)))
+                if all(k in found for k in ("name", "id", "pw")):
+                    df = sheet_df
+                    col_map = found
+                    if len(xls.sheet_names) > 1:
+                        st.info(f"'{sheet_name}' 시트에서 이름/아이디/비밀번호 컬럼을 찾았습니다 (전체 시트: {xls.sheet_names}).")
+                    break
         except Exception as e:
             st.error(f"엑셀을 읽는 중 오류가 발생했습니다: {e}")
             df = None
 
-        if df is not None:
-            col_map = {}
-            for col in df.columns:
-                c = str(col).strip()
-                if c in ("이름", "성함", "name", "Name"):
-                    col_map["name"] = col
-                elif c in ("아이디", "ID", "id", "Id"):
-                    col_map["id"] = col
-                elif c in ("비밀번호", "비번", "PW", "pw", "password", "Password"):
-                    col_map["pw"] = col
-
-            if not all(k in col_map for k in ("name", "id", "pw")):
-                st.error(
-                    "엑셀에서 '이름', '아이디', '비밀번호' 컬럼을 찾지 못했습니다. "
-                    f"현재 컬럼: {list(df.columns)}"
-                )
-            else:
+        if df is None:
+            detail = "; ".join(f"[{name}] {cols}" for name, cols in checked_sheets)
+            st.error(
+                "엑셀의 어느 시트에서도 '이름', '아이디', '비밀번호' 컬럼을 찾지 못했습니다. "
+                f"확인한 시트/컬럼: {detail}"
+            )
+        else:
                 # 이름 기준으로 마지막 값이 이기도록 먼저 dict로 정리합니다.
                 # (TOML은 같은 테이블을 두 번 선언하는 것 자체가 오류라서, 중복 이름을
                 #  그대로 두면 Secrets 텍스트 전체가 파싱 실패로 깨집니다 — 반드시 이름당
