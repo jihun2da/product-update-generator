@@ -156,6 +156,17 @@
 해제하고 실행하시면 브라우저 창이 실제로 뜨는 걸 볼 수 있습니다(Streamlit Cloud에는
 화면이 없어서 이 옵션이 동작하지 않습니다).
 
+⚠️ 오류 수정 (2026-08-26) — 로컬(Windows)에서 실행 시 "NotImplementedError" 발생
+문제: 로컬 Windows PC에서 `streamlit run app.py`로 실행 중 업로드를 시작하면
+"NotImplementedError" (…asyncio/base_events.py, _make_subprocess_transport…) 오류가
+발생하며 Chromium 자체가 실행되지 못하는 문제가 있었습니다. 원인은 Streamlit이 내부적으로
+사용하는 웹서버(Tornado)가 Windows에서 자식 프로세스 실행을 지원하지 않는 이벤트 루프
+정책(WindowsSelectorEventLoopPolicy)을 설정해두기 때문으로, Playwright가 Chromium을
+자식 프로세스로 띄우려 할 때 이 제약에 걸립니다. 이제 업로드 시작 직전에 자식 프로세스
+실행을 지원하는 정책(WindowsProactorEventLoopPolicy)으로 자동 전환하도록 수정했습니다.
+Windows가 아닌 환경(Streamlit Cloud 등 리눅스 서버)에서는 이 로직이 아무 동작도 하지
+않도록(no-op) 만들어, 기존 클라우드 동작에는 영향이 없습니다.
+
 참고 / 주의사항
 ----------------
 - 기린 파일과 S파일의 행(상품) 수가 다르면 더 적은 쪽 행 수까지만 E,F,G/AJ를 복사하고

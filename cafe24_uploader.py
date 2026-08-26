@@ -15,6 +15,7 @@
   추가할 때 참고용으로 계속 활용하시면 됩니다.
 """
 
+import asyncio
 import os
 import sys
 import subprocess
@@ -281,12 +282,32 @@ def _safe_screenshot(page):
         return None
 
 
+def _ensure_windows_subprocess_event_loop():
+    """Windows에서 Streamlit(=Tornado) 서버가 asyncio 이벤트 루프 정책을
+    WindowsSelectorEventLoopPolicy로 설정해두는 경우가 있는데, 이 정책은
+    자식 프로세스(subprocess) 실행을 지원하지 않아 Playwright가 Chromium을
+    실행하려 할 때 'NotImplementedError'가 발생합니다(로컬 Windows에서 실제로
+    확인된 오류). Playwright 실행 직전에 subprocess를 지원하는
+    WindowsProactorEventLoopPolicy로 되돌려줍니다.
+    Windows가 아니거나(예: Streamlit Cloud의 리눅스 서버) 어떤 이유로 정책
+    변경이 안 되더라도 예외를 삼켜 기존 동작에는 영향이 없도록 합니다."""
+    if not sys.platform.startswith("win"):
+        return
+    try:
+        policy_cls = getattr(asyncio, "WindowsProactorEventLoopPolicy", None)
+        if policy_cls is not None and not isinstance(asyncio.get_event_loop_policy(), policy_cls):
+            asyncio.set_event_loop_policy(policy_cls())
+    except Exception:
+        pass
+
+
 def run_batch_upload(accounts, headless=True, post_delay_sec=3, progress_cb=None) -> List[AccountResult]:
     """
     accounts: [{'name':.., 'id':.., 'password':.., 'file_bytes':.., 'file_name':..}, ...]
     progress_cb: 선택. callable(index, total, AccountResult) — 진행 상황 콜백(Streamlit 갱신용)
     반환: AccountResult 리스트 (accounts와 같은 순서)
     """
+    _ensure_windows_subprocess_event_loop()
     results = []
     with sync_playwright() as p:
         total = len(accounts)
