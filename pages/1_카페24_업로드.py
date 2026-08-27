@@ -495,11 +495,27 @@ if results:
                     for e in net_log:
                         if e.get("kind") == "요청":
                             net_lines.append(f"[{e['phase']}] 요청 {e.get('method','')} {e.get('url','')}")
+                        elif e.get("kind") == "요청실패":
+                            net_lines.append(f"[{e['phase']}] ❌ 요청 실패 {e.get('url','')} ({e.get('error','')})")
                         else:
                             net_lines.append(f"[{e['phase']}] 응답 {e.get('status','')} {e.get('url','')}")
                     st.code("\n".join(net_lines), language="text")
                 else:
                     st.caption("기록된 요청 없음")
+
+                popup_log = getattr(r, "popup_page_log", None) or []
+                st.write(f"**팝업 페이지 처리 로그** ({len(popup_log)}건):")
+                st.caption(
+                    "💡 '엑셀 업로드' 버튼을 누른 뒤 새로 열리는 팝업 페이지(예: \"해당 파일을 "
+                    "업로드 하시겠습니까?\" 확인창이 네이티브 대화상자가 아니라 진짜 팝업 페이지로 "
+                    "뜨는 경우)마다, 그 안에서 '확인' 버튼을 자동으로 클릭했는지 / 못 찾아서 그냥 "
+                    "닫았는지를 기록합니다. '확인 버튼을 찾지 못함'이 반복된다면 이 페이지의 실제 "
+                    "버튼 문구가 '확인'이 아닐 수 있으니 알려주세요."
+                )
+                if popup_log:
+                    st.code("\n".join(popup_log), language="text")
+                else:
+                    st.caption("기록된 팝업 페이지 없음 (네이티브 확인창만 있었거나, 팝업 자체가 없었을 수 있습니다)")
 
                 console_log = getattr(r, "console_log", None) or []
                 st.write(f"**브라우저 콘솔 로그** ({len(console_log)}건):")
