@@ -92,9 +92,10 @@ def _close_popups(context, page):
 
     close_selectors = [
         # "상품등록용 엑셀 다운로드" 안내 walkthrough(Step1/3 등) 팝업의 닫기(x) 버튼 —
-        # 실제 화면에서 사용자가 직접 확인한 정확한 경로입니다(2026-08-27). 다른
-        # 선택자보다 먼저 시도합니다.
-        'xpath=//*[@id="QA_upload2"]/div[2]/div[1]/div[1]/div/button',
+        # 실제 화면에서 사용자가 직접 확인한 정확한 경로입니다(2026-08-27 최초 확인 후,
+        # 실사용 중 안 닫히는 것이 확인되어 2026-08-27 같은 날 아래 경로로 재확인/수정).
+        # 다른 선택자보다 먼저 시도합니다.
+        'xpath=//*[@id="QA_upload2"]/div[2]/div[2]/div[1]/div/button',
         "button:has-text('확인')",
         "button:has-text('닫기')",
         "[aria-label='닫기']",
