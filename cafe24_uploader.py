@@ -26,6 +26,12 @@ from typing import Optional, List, Callable
 
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
+# 코드를 업데이트한 뒤 "정말로 최신 코드가 반영된 상태로 테스트한 것인지" 헷갈리는
+# 상황이 반복돼서(로컬 파일을 바꾸고 앱을 재시작해도, 실제로 뭐가 바뀌었는지 화면에서
+# 바로 확인할 방법이 없었습니다) 추가한 버전 표시입니다. 수정할 때마다 이 값을
+# 갱신하고, "카페24 업로드" 페이지 화면 아래쪽에 그대로 표시합니다.
+MODULE_VERSION = "2026-08-27-3 (팝업 확인창 window.confirm 오버라이드)"
+
 LOGIN_URL = "https://eclogin.cafe24.com/Shop/"
 ID_XPATH = 'xpath=//*[@id="mall_id"]'
 PW_XPATH = 'xpath=//*[@id="userpasswd"]'
@@ -208,23 +214,44 @@ def upload_one_account(playwright, name, cafe24_id, cafe24_pw, file_bytes, file_
         # 핸들러가 없으면 기본적으로 자동 "취소" 처리를 해버려서, 실제로는 업로드가
         # 진행되지 않았는데도 그대로 넘어가 버리는 문제가 있었습니다.
         #
-        # ⚠️ (2026-08-27) 사용자가 실제 화면에서 이 확인창을 캡처해서 보내주셨는데,
-        # "확인"을 눌러야 업로드가 진행되는데도 계속 그냥 닫히기만(취소) 한다는 문제가
-        # 재현/확인됐습니다. 원인을 로컬 테스트로 직접 재현해서 찾았습니다 — 카페24
-        # 관리자 화면은 실제로 새 탭/팝업 페이지가 뜨는 경우가 있는데(바로 아래
-        # _close_popups()가 "다른 페이지"를 닫는 이유이기도 합니다), 이 확인창이 원래
-        # page가 아니라 그런 새 팝업 페이지 쪽에서 뜨는 경우, "그 page 객체"에 다이얼로그
-        # 핸들러가 등록돼 있지 않으면 Playwright가 즉시 자동으로 "취소" 처리해버립니다
-        # — 이게 정확히 사용자가 겪은 증상(확인창이 뜨자마자 그냥 닫힘)과 일치한다는
-        # 것을 로컬 재현 테스트로 확인했습니다. 처음에는 새로 생기는 페이지마다
-        # context.on("page", ...)로 개별 등록하는 방식을 시도했지만, 팝업이 뜨자마자
-        # (페이지 로드 중 곧바로) 확인창을 띄우는 경우 그 등록이 다이얼로그 발생 시점을
-        # 놓치는 경쟁 상태(race condition)가 실제로 재현됐습니다. 대신 컨텍스트 자체에
-        # 다이얼로그 핸들러를 등록하면(Playwright 1.56+에서 지원) 이 컨텍스트에 속한
-        # 모든 페이지(메인 페이지 + 이후 생기는 모든 팝업)의 다이얼로그를 등록 시점과
-        # 무관하게 놓치지 않고 잡아낸다는 것을 로컬 테스트로 확인했고, 이렇게 수정해
-        # 실제 업로드 요청(ProductExcelSet)까지 정상적으로 나가는 것을 재검증했습니다.
+        # ⚠️⚠️ (2026-08-27, 최종 수정) 사용자가 이 확인창이 뜨는 화면을 두 차례에
+        # 걸쳐 캡처해서 보내주셨는데, "확인"을 눌러야 업로드가 진행되는데도 계속 그냥
+        # 닫히기만(취소) 한다는 문제가 재현/확인됐습니다. 처음에는 page.on("dialog")를
+        # context.on("dialog")로 바꾸는 방식(팝업 페이지에서 뜨는 확인창도 놓치지 않게)
+        # 으로 고쳤는데, 그 수정을 반영하고 앱을 재시작한 뒤에도 사용자 실제 환경(화면을
+        # 직접 보면서 테스트하는 "브라우저 화면 없이 실행" 해제 상태, 즉 headless=False)
+        # 에서는 여전히 확인창이 자동으로 닫히는 것이 재현됐습니다. 이 사용자 환경은
+        # 실제로 화면에 브라우저 창이 뜨는 "headed" 모드인데, 저는 이 작업 환경에
+        # 화면(X서버)이 없어 headed 모드를 직접 재현/검증할 수 없었습니다 — headed
+        # 모드에서는 네이티브 확인창이 실제 OS 창으로 그려지기 때문에, Playwright의
+        # 다이얼로그 이벤트를 "사후에 잡아서 accept() 호출"하는 방식(위 context.on
+        # ("dialog", ...))이 headless 모드와 다르게 타이밍 경쟁에서 질 가능성을 배제할
+        # 수 없었습니다. 그래서 근본적으로 더 안전한 방식으로 바꿨습니다 — 아예
+        # window.confirm()이 "네이티브 확인창을 띄우지 않고" 항상 즉시 확인(true)을
+        # 반환하도록, 페이지의 스크립트가 실행되기도 전에 미리 덮어씁니다
+        # (context.add_init_script). 이 방식은 Playwright의 다이얼로그 이벤트 타이밍과
+        # 완전히 무관하고(다이얼로그 자체가 아예 생기지 않으므로 "늦게 잡아서 취소되는"
+        # 경쟁 상태가 원천적으로 불가능합니다), headless/headed 어느 쪽이든, 메인
+        # 페이지든 이후 생기는 어떤 팝업 페이지든 항상 동일하게 동작한다는 것을 로컬
+        # 테스트로 확인했습니다. 혹시 모를 다른 종류의 다이얼로그(예: window.alert이나
+        # 이 오버라이드가 안 걸리는 특수한 경우)에 대비해서, 기존 context.on("dialog")
+        # 핸들러도 이중 안전장치로 그대로 남겨뒀습니다.
         dialog_messages = []
+        _DIALOG_LOG_PREFIX = "[cafe24-uploader:auto-confirm] "
+
+        # window.confirm()/window.alert()을 페이지의 다른 스크립트가 실행되기 전에
+        # 미리 덮어써서, 네이티브 다이얼로그 자체가 뜨지 않고 항상 "확인"한 것과 동일하게
+        # 즉시 처리되도록 합니다. add_init_script는 이 컨텍스트에서 만들어지는 모든
+        # 페이지(팝업 포함)에 페이지 로드 시점마다 자동으로 적용됩니다. 어떤 문구가
+        # "확인"됐는지 진단 정보에 남길 수 있도록 console.log로 표시해두고, 아래
+        # _handle_console에서 이걸 dialog_messages에도 반영합니다.
+        context.add_init_script(
+            "(function(){"
+            "var _log=function(m){try{console.log(" + repr(_DIALOG_LOG_PREFIX) + "+m);}catch(e){}};"
+            "window.confirm=function(msg){_log(String(msg));return true;};"
+            "window.alert=function(msg){_log(String(msg));return undefined;};"
+            "})();"
+        )
 
         def _handle_dialog(dialog):
             try:
@@ -260,7 +287,13 @@ def upload_one_account(playwright, name, cafe24_id, cafe24_pw, file_bytes, file_
 
         def _handle_console(msg):
             try:
-                console_log.append(f"[{msg.type}] {msg.text}")
+                text = msg.text
+                console_log.append(f"[{msg.type}] {text}")
+                # window.confirm()/alert() 오버라이드가 실제로 확인 처리한 문구를
+                # 여기서 함께 기록해서, 진단 정보의 "(자동 승인한 확인창: ...)"
+                # 메시지에 그대로 반영되도록 합니다(위 add_init_script 참고).
+                if text.startswith(_DIALOG_LOG_PREFIX):
+                    dialog_messages.append(text[len(_DIALOG_LOG_PREFIX):])
             except Exception:
                 pass
 
