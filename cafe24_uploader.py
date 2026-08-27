@@ -298,6 +298,21 @@ def upload_one_account(playwright, name, cafe24_id, cafe24_pw, file_bytes, file_
             msg += " — 이 계정은 재시도하지 않았습니다. 스크린샷을 확인해주세요."
             return AccountResult(name=name, status="error", message=msg, screenshot=shot)
 
+        # 업로드 버튼 클릭(및 확인창 승인) 직후, 실제 서버 처리가 끝나기 전에 브라우저를
+        # 닫아버리면 파일이 화면에는 "진행중 100%"로 붙어 있는 것처럼 보여도 실제로는
+        # 아무것도 반영되지 않는 문제가 실사용 중 확인됐습니다 — 특히 상품 수가 많은
+        # 파일일수록 서버 처리 시간이 길어, 고정된 대기 시간(post_delay_sec)만으로는
+        # 부족할 수 있습니다. 고정 대기 전에 먼저 네트워크 활동이 잠잠해질 때까지
+        # (진행 중이던 업로드 요청이 실제로 끝날 때까지) 기다립니다 — 최대
+        # 60초까지 기다리고, 그래도 안 끝나면 예외를 삼키고 아래 고정 대기로 넘어갑니다
+        # (무한 대기는 방지).
+        try:
+            page.wait_for_load_state("networkidle", timeout=60000)
+        except PlaywrightTimeoutError:
+            pass
+        except Exception:
+            pass
+
         time.sleep(post_delay_sec)
 
         body_text = ""
