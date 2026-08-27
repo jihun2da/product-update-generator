@@ -368,7 +368,13 @@ debug_pause = st.checkbox(
     "'브라우저 화면 없이 실행(headless)'이 체크된 상태에서는 볼 화면이 없어 "
     "사용할 수 없습니다(자동으로 비활성화됩니다).",
 )
-post_delay = st.number_input("계정별 업로드 버튼 클릭 후 대기 시간(초)", min_value=1, value=3, step=1)
+post_delay = st.number_input(
+    "계정별 업로드 버튼 클릭 후 최종 대기 시간(초)",
+    min_value=1, value=5, step=1,
+    help="업로드 버튼을 누른 뒤, 실제 서버 처리가 끝날 때까지 자동으로 먼저 기다린 다음"
+    "(최대 60초, 네트워크 활동이 잠잠해질 때까지) 추가로 더 기다리는 시간입니다. "
+    "상품 수가 많은 파일이라 평소보다 오래 걸리는 것 같으면 이 값을 늘려보세요.",
+)
 
 start_clicked = st.button(
     "선택된 계정 업로드 시작",
