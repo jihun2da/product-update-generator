@@ -429,6 +429,7 @@ if results:
             "이름": [r.name for r in results],
             "상태": [status_label.get(r.status, r.status) for r in results],
             "메시지": [r.message for r in results],
+            "진단": [getattr(r, "diagnosis", "") for r in results],
         }
     )
     st.dataframe(result_df, use_container_width=True, hide_index=True)
@@ -441,6 +442,58 @@ if results:
         )
     else:
         st.success("모든 계정이 성공으로 판별됐습니다. (자동 판별이므로 스크린샷으로 실제 반영 여부를 꼭 확인해주세요)")
+
+    with st.expander("🔍 진단 정보 (버튼 클릭이 실제로 서버에 전달됐는지 증거로 확인)", expanded=True):
+        st.caption(
+            "💡 '버튼을 클릭했다'는 것과 '클릭이 실제로 서버에 요청을 보냈다'는 것은 다를 수 "
+            "있습니다. 아래는 추측이 아니라 실제로 관찰한 증거(클릭 후 발생한 네트워크 요청/응답, "
+            "버튼 HTML 변화, 콘솔 로그)를 바탕으로 자동 판정한 결과입니다. 문제가 계속되면 이 "
+            "내용을 그대로 복사해서 알려주시면 훨씬 정확하게 원인을 찾을 수 있습니다."
+        )
+        for r in results:
+            diag = getattr(r, "diagnosis", "")
+            st.write(f"**{r.name}**")
+            if diag.startswith("🔴"):
+                st.error(diag)
+            elif diag.startswith("🟠"):
+                st.warning(diag)
+            elif diag.startswith("🟢"):
+                st.success(diag)
+            elif diag:
+                st.caption(diag)
+            else:
+                st.caption("진단 정보 없음 (로그인 실패 등 버튼 클릭 이전 단계에서 종료됨)")
+
+            with st.expander(f"{r.name} — 상세 로그 (네트워크 / 콘솔 / 버튼 HTML)", expanded=False):
+                btn_before = getattr(r, "button_html_before", None)
+                btn_after = getattr(r, "button_html_after", None)
+                st.write("**업로드 버튼 HTML — 클릭 전:**")
+                st.code(btn_before or "(캡처 안 됨)", language="html")
+                st.write("**업로드 버튼 HTML — 클릭 후:**")
+                st.code(btn_after or "(캡처 안 됨)", language="html")
+                if btn_before and btn_after and btn_before == btn_after:
+                    st.caption("⚠️ 클릭 전후 버튼 HTML이 완전히 동일합니다 (변화 없음).")
+
+                net_log = getattr(r, "network_log", None) or []
+                st.write(f"**네트워크 요청/응답 로그** ({len(net_log)}건, xhr/fetch/document만):")
+                if net_log:
+                    net_lines = []
+                    for e in net_log:
+                        if e.get("kind") == "요청":
+                            net_lines.append(f"[{e['phase']}] 요청 {e.get('method','')} {e.get('url','')}")
+                        else:
+                            net_lines.append(f"[{e['phase']}] 응답 {e.get('status','')} {e.get('url','')}")
+                    st.code("\n".join(net_lines), language="text")
+                else:
+                    st.caption("기록된 요청 없음")
+
+                console_log = getattr(r, "console_log", None) or []
+                st.write(f"**브라우저 콘솔 로그** ({len(console_log)}건):")
+                if console_log:
+                    st.code("\n".join(console_log), language="text")
+                else:
+                    st.caption("기록된 콘솔 로그 없음")
+            st.divider()
 
     with st.expander("계정별 스크린샷 보기 (클릭 전 / 클릭 직후 / 최종 3장 비교)", expanded=False):
         st.caption(
