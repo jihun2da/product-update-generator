@@ -30,7 +30,7 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 # 상황이 반복돼서(로컬 파일을 바꾸고 앱을 재시작해도, 실제로 뭐가 바뀌었는지 화면에서
 # 바로 확인할 방법이 없었습니다) 추가한 버전 표시입니다. 수정할 때마다 이 값을
 # 갱신하고, "카페24 업로드" 페이지 화면 아래쪽에 그대로 표시합니다.
-MODULE_VERSION = "2026-08-27-3 (팝업 확인창 window.confirm 오버라이드)"
+MODULE_VERSION = "2026-08-27-4 (업로드 확인창이 진짜 팝업 페이지로 뜨는 경우까지 처리 + 진단 강화)"
 
 LOGIN_URL = "https://eclogin.cafe24.com/Shop/"
 ID_XPATH = 'xpath=//*[@id="mall_id"]'
@@ -82,6 +82,12 @@ class AccountResult:
     # 뜻으로, 지금까지 반복된 문제의 가장 유력한 원인입니다.
     submit_request_sent: bool = False
     submit_response_status: Optional[int] = None
+    # 업로드 버튼을 누른 뒤 새로 열린 팝업 페이지들에 대해 무엇을 했는지(확인 버튼을
+    # 자동으로 눌렀는지 / 확인 버튼을 못 찾아 정리용으로 닫았는지)를 시간 순서대로
+    # 남긴 로그입니다. "확인을 눌러야 하는데 그냥 닫혀버린다"는 문제를 다시 진단해야
+    # 할 때, 이 로그를 보면 실제로 어떤 페이지에 무슨 조치를 했는지 바로 확인할 수
+    # 있습니다.
+    popup_page_log: Optional[List[str]] = None
 
 
 def ensure_chromium_installed(status_cb: Optional[Callable[[str], None]] = None):
@@ -108,7 +114,61 @@ def ensure_chromium_installed(status_cb: Optional[Callable[[str], None]] = None)
     return True, None
 
 
-def _close_popups(context, page):
+# "확인"류 버튼을 찾을 때 공통으로 쓰는 선택자 후보들. 카페24의 업로드 확인창이
+# 네이티브 confirm()이 아니라 진짜 팝업 페이지(새 탭/창)에 HTML로 그려지는 경우까지
+# 대비합니다 — 아래 _try_click_confirm_button 참고.
+_CONFIRM_BUTTON_SELECTORS = [
+    "button:has-text('확인')",
+    "input[type=button][value='확인']",
+    "input[type=submit][value='확인']",
+    "a:has-text('확인')",
+    "button:has-text('예')",
+    "button:has-text('네')",
+]
+
+# 정보성/광고성 팝업을 "닫기"로 정리할 때 쓰는 선택자 후보들. "확인" 버튼을 먼저
+# 시도했는데도 못 찾은 경우에만 이 목록으로 넘어갑니다(아래 _close_popups 참고).
+_DISMISS_POPUP_SELECTORS = [
+    # "상품등록용 엑셀 다운로드" 안내 walkthrough(Step1/3 등) 팝업의 닫기(x) 버튼 —
+    # 실제 화면에서 사용자가 직접 확인한 정확한 경로입니다(2026-08-27 최초 확인 후,
+    # 실사용 중 안 닫히는 것이 확인되어 2026-08-27 같은 날 아래 경로로 재확인/수정).
+    # 다른 선택자보다 먼저 시도합니다.
+    'xpath=//*[@id="QA_upload2"]/div[2]/div[2]/div[1]/div/button',
+    "button:has-text('닫기')",
+    "[aria-label='닫기']",
+    "[aria-label='close']",
+    ".btn_close",
+    ".pop_close",
+    ".close",
+]
+
+
+def _try_click_confirm_button(page_obj, wait_ms=3000):
+    """주어진 page(주로 새로 열린 팝업 페이지) 안에서 "확인"류 버튼을 찾아 클릭을
+    시도합니다. 성공하면 (True, 클릭 전 화면에 있던 문구 일부)를, 못 찾거나 실패하면
+    (False, 화면에 있던 문구 일부)를 반환합니다. 예외는 모두 삼켜서 호출부의 흐름에
+    영향을 주지 않습니다(진단 목적의 최선 노력 함수)."""
+    try:
+        page_obj.wait_for_load_state("domcontentloaded", timeout=wait_ms)
+    except Exception:
+        pass
+    text_snippet = ""
+    try:
+        text_snippet = " ".join(page_obj.locator("body").inner_text(timeout=800).split())[:200]
+    except Exception:
+        text_snippet = ""
+    for sel in _CONFIRM_BUTTON_SELECTORS:
+        try:
+            loc = page_obj.locator(sel).first
+            if loc.count() > 0 and loc.is_visible(timeout=800):
+                loc.click(timeout=1500)
+                return True, text_snippet
+        except Exception:
+            continue
+    return False, text_snippet
+
+
+def _close_popups(context, page, dialog_messages=None, popup_page_log=None, click_state=None):
     """페이지 위에 남아있는 팝업(새 탭 또는 인페이지 모달)을 최대한 정리합니다.
     실패해도 전체 흐름에 영향 주지 않도록 예외를 삼킵니다.
 
@@ -118,30 +178,79 @@ def _close_popups(context, page):
     때문입니다(실사용 테스트 중 발견 — 클릭이 막혀도 조용히 넘어가면 실제로는 아무
     것도 업로드되지 않았는데 "성공"으로 잘못 표시되는 문제가 있어, 이제는 클릭 자체가
     끝까지 실패하면 성공으로 처리하지 않고 오류로 보고합니다. 아래 upload_one_account
-    참고)."""
-    time.sleep(1)
-    for p in list(context.pages):
-        if p is not page:
-            try:
-                p.close()
-            except Exception:
-                pass
+    참고).
 
-    close_selectors = [
-        # "상품등록용 엑셀 다운로드" 안내 walkthrough(Step1/3 등) 팝업의 닫기(x) 버튼 —
-        # 실제 화면에서 사용자가 직접 확인한 정확한 경로입니다(2026-08-27 최초 확인 후,
-        # 실사용 중 안 닫히는 것이 확인되어 2026-08-27 같은 날 아래 경로로 재확인/수정).
-        # 다른 선택자보다 먼저 시도합니다.
-        'xpath=//*[@id="QA_upload2"]/div[2]/div[2]/div[1]/div/button',
-        "button:has-text('확인')",
-        "button:has-text('닫기')",
-        "[aria-label='닫기']",
-        "[aria-label='close']",
-        ".btn_close",
-        ".pop_close",
-        ".close",
-    ]
-    for sel in close_selectors:
+    ⚠️⚠️ (2026-08-27, 재수정) 사용자가 실제 화면을 직접 지켜본 결과, "엑셀 업로드"
+    버튼을 누른 직후 뜨는 "해당 파일을 업로드 하시겠습니까?" 확인창이 우리 코드에
+    의해 "확인"이 눌리지 않고 그냥 닫히기만 해서 업로드가 더 이상 진행되지 않는
+    것을 목격했습니다. 원인을 다시 점검해보니, 이 함수가 지금까지 메인 페이지(page)가
+    아닌 다른 모든 페이지를, 그 안의 내용이 무엇인지 전혀 확인하지 않고 무조건
+    p.close()로 먼저 닫아버리고 있었습니다(바로 아래). 만약 카페24의 이 확인창이
+    네이티브 confirm() 대화상자가 아니라 window.open()으로 열리는 진짜 별도의 팝업
+    페이지에 HTML로 그려지는 것이라면(네이티브 dialog에는 이미 window.confirm 오버라이드
+    +context.on("dialog")로 대비해뒀지만, 이 경우는 전혀 다른 케이스입니다), 그 안의
+    "확인" 버튼을 눌러볼 기회도 없이 그냥 닫아버려서 업로드가 취소된 것과 똑같은
+    결과를 우리 코드가 스스로 만들어내고 있었던 셈입니다 — 사용자가 목격한 증상과
+    정확히 일치합니다. 이제는 다른 페이지를 닫기 전에 반드시 먼저 그 안에서 "확인"류
+    버튼을 찾아 클릭을 시도하고, 성공하면 그 페이지를 곧바로 닫지 않습니다(확인으로
+    촉발된 실제 업로드 요청이 그 페이지에서 진행 중일 수 있으므로, 강제로 끊지
+    않기 위함). "확인" 버튼을 끝내 찾지 못한 경우에만(=업로드 확인창이 아니라 진짜
+    광고/안내성 팝업으로 판단) 기존처럼 닫기 버튼을 시도한 뒤 정리합니다.
+    """
+    time.sleep(1)
+
+    if dialog_messages is None:
+        dialog_messages = []
+    if popup_page_log is None:
+        popup_page_log = []
+    phase = "클릭 후" if (click_state and click_state.get("clicked")) else "클릭 전"
+
+    for p in list(context.pages):
+        if p is page:
+            continue
+        try:
+            if p.is_closed():
+                continue
+        except Exception:
+            pass
+
+        clicked, text_snippet = False, ""
+        try:
+            clicked, text_snippet = _try_click_confirm_button(p, wait_ms=1500)
+        except Exception:
+            pass
+
+        if clicked:
+            popup_page_log.append(
+                f"[{phase}] 팝업 페이지에서 확인 버튼 자동 클릭"
+                + (f": \"{text_snippet}\"" if text_snippet else "")
+            )
+            dialog_messages.append(text_snippet or "(팝업 페이지 확인 버튼 자동 클릭)")
+            # 확인을 누른 페이지는 곧바로 닫지 않습니다 — 그 클릭으로 촉발된 실제
+            # 업로드 요청이 이 페이지에서 나가는 도중일 수 있어, 강제로 닫으면 그
+            # 요청이 중간에 끊어질 수 있습니다.
+            continue
+
+        for sel in _DISMISS_POPUP_SELECTORS:
+            try:
+                loc = p.locator(sel).first
+                if loc.count() > 0 and loc.is_visible(timeout=500):
+                    loc.click(timeout=1000)
+                    time.sleep(0.3)
+            except Exception:
+                continue
+        try:
+            if not p.is_closed():
+                p.close()
+                popup_page_log.append(
+                    f"[{phase}] 팝업 페이지 닫음 (확인 버튼을 찾지 못해 정리용 팝업으로 판단, "
+                    f"화면 문구: \"{text_snippet}\")" if text_snippet else
+                    f"[{phase}] 팝업 페이지 닫음 (확인 버튼을 찾지 못해 정리용 팝업으로 판단)"
+                )
+        except Exception:
+            pass
+
+    for sel in _DISMISS_POPUP_SELECTORS:
         try:
             loc = page.locator(sel).first
             if loc.count() > 0 and loc.is_visible(timeout=500):
@@ -205,6 +314,7 @@ def upload_one_account(playwright, name, cafe24_id, cafe24_pw, file_bytes, file_
     diagnosis = ""
     network_log = []
     console_log = []
+    popup_page_log = []
     try:
         browser = playwright.chromium.launch(headless=headless, args=["--no-sandbox"])
         context = browser.new_context(accept_downloads=False)
@@ -237,6 +347,10 @@ def upload_one_account(playwright, name, cafe24_id, cafe24_pw, file_bytes, file_
         # 이 오버라이드가 안 걸리는 특수한 경우)에 대비해서, 기존 context.on("dialog")
         # 핸들러도 이중 안전장치로 그대로 남겨뒀습니다.
         dialog_messages = []
+        popup_page_log = []
+        # 클릭 전/후 구분(및 새 팝업 페이지 핸들러)에 함께 쓰이므로, 페이지 생성 전에
+        # 미리 정의해둡니다.
+        click_state = {"clicked": False}
         _DIALOG_LOG_PREFIX = "[cafe24-uploader:auto-confirm] "
 
         # window.confirm()/window.alert()을 페이지의 다른 스크립트가 실행되기 전에
@@ -265,7 +379,45 @@ def upload_one_account(playwright, name, cafe24_id, cafe24_pw, file_bytes, file_
 
         context.on("dialog", _handle_dialog)
 
+        # ⚠️⚠️ (2026-08-27, 재수정) 위 window.confirm 오버라이드는 "네이티브
+        # 자바스크립트 대화상자"에만 적용됩니다. 사용자가 실제 화면을 지켜본 결과,
+        # "엑셀 업로드" 버튼을 누른 직후 뜨는 확인창이 여전히 우리 코드에 의해 그냥
+        # 닫혀버리는 것을 목격했는데, 이는 그 확인창이 네이티브 dialog가 아니라
+        # window.open()으로 열리는 진짜 별도의 팝업 페이지에 HTML로 그려지는
+        # 것이었을 가능성을 강하게 시사합니다(이 경우 window.confirm 오버라이드는
+        # 전혀 관여하지 않습니다 — 애초에 confirm()을 호출하는 게 아니기 때문입니다).
+        # 새로운 페이지가 생성되는 즉시(page 이벤트) 그 안에서 "확인"류 버튼을 찾아
+        # 자동으로 클릭을 시도하는 안전장치를 추가합니다. 네이티브 dialog와 달리
+        # 실제 페이지에 그려지는 버튼은 Playwright가 자동으로 취소해버리지 않고 그대로
+        # 남아있으므로(페이지 생성 이벤트를 늦게 받아도 버튼 자체가 사라지지 않음),
+        # 예전에 네이티브 dialog에서 문제가 됐던 "늦게 등록해서 놓치는" 경쟁 상태가
+        # 여기서는 발생하지 않습니다.
+        def _handle_new_page(new_page):
+            try:
+                clicked, text_snippet = _try_click_confirm_button(new_page, wait_ms=4000)
+            except Exception:
+                clicked, text_snippet = False, ""
+            phase = "클릭 후" if click_state["clicked"] else "클릭 전"
+            if clicked:
+                popup_page_log.append(
+                    f"[{phase}] 새로 열린 팝업 페이지에서 확인 버튼 자동 클릭"
+                    + (f": \"{text_snippet}\"" if text_snippet else "")
+                )
+                dialog_messages.append(text_snippet or "(팝업 페이지 확인 버튼 자동 클릭)")
+            else:
+                popup_page_log.append(
+                    f"[{phase}] 새 팝업 페이지 감지(확인 버튼을 찾지 못함"
+                    + (f", 화면 문구: \"{text_snippet}\")" if text_snippet else ")")
+                )
+
         page = context.new_page()
+
+        # 메인 페이지(위 page) 자체를 만드는 context.new_page() 호출도 "page" 이벤트를
+        # 발생시키므로, 핸들러 등록을 메인 페이지 생성 "이후"로 둡니다 — 그래야 메인
+        # 페이지 자체가 "확인 버튼을 못 찾은 팝업"으로 진단 로그에 잘못 찍히는 것을
+        # 막을 수 있습니다. 이 시점 이전에는 실제 팝업이 열릴 수 없으므로(아직 아무
+        # 페이지도 로그인조차 시작하지 않은 상태) 놓치는 팝업은 없습니다.
+        context.on("page", _handle_new_page)
 
         # "업로드 버튼을 눌렀는데 실제로 반영이 안 된다"는 문제가 대기 시간을 늘려도
         # 계속 재현돼서, 더 이상 추측으로 고치지 않고 실제로 무슨 일이 일어나는지
@@ -283,7 +435,6 @@ def upload_one_account(playwright, name, cafe24_id, cafe24_pw, file_bytes, file_
         # 직접 봤습니다). 다이얼로그와 마찬가지로 page 대신 context 레벨에 등록해서,
         # 메인 페이지든 이후 생기는 어떤 팝업이든 상관없이 콘솔/요청/응답을 전부
         # 놓치지 않고 기록하도록 수정했습니다.
-        click_state = {"clicked": False}
 
         def _handle_console(msg):
             try:
@@ -321,9 +472,27 @@ def upload_one_account(playwright, name, cafe24_id, cafe24_pw, file_bytes, file_
             except Exception:
                 pass
 
+        # "요청은 나갔는데 응답이 안 왔다"는 진단이 나올 때, 그게 단순히 "서버가
+        # 느린 것"인지 "요청 자체가 중간에 끊어진 것"인지 구분할 방법이 없었습니다.
+        # requestfailed는 요청이 (타임아웃이 아니라) 중단/실패로 끝났을 때
+        # 발생하는 이벤트라서, 여기에 기록해두면 두 경우를 구분해서 훨씬 정확한
+        # 진단 문구를 보여줄 수 있습니다(아래 diagnosis 로직 참고).
+        def _handle_request_failed(request):
+            try:
+                if request.resource_type in ("xhr", "fetch", "document"):
+                    network_log.append({
+                        "phase": "클릭 후" if click_state["clicked"] else "클릭 전",
+                        "kind": "요청실패",
+                        "url": request.url,
+                        "error": request.failure or "알 수 없는 오류",
+                    })
+            except Exception:
+                pass
+
         context.on("console", _handle_console)
         context.on("request", _handle_request)
         context.on("response", _handle_response)
+        context.on("requestfailed", _handle_request_failed)
 
         page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=nav_timeout_ms)
         page.locator(ID_XPATH).fill(cafe24_id)
@@ -345,10 +514,11 @@ def upload_one_account(playwright, name, cafe24_id, cafe24_pw, file_bytes, file_
             reason = LOGIN_FAIL_TEXT if LOGIN_FAIL_TEXT in body_text else "로그인 후에도 로그인 페이지에 머물러 있습니다."
             return AccountResult(
                 name=name, status="login_fail", message=reason, screenshot=shot,
-                network_log=network_log, console_log=console_log,
+                network_log=network_log, console_log=console_log, popup_page_log=popup_page_log,
             )
 
-        _close_popups(context, page)
+        _close_popups(context, page, dialog_messages=dialog_messages,
+                      popup_page_log=popup_page_log, click_state=click_state)
 
         try:
             base_url = page.evaluate("window.location.origin")
@@ -370,7 +540,8 @@ def upload_one_account(playwright, name, cafe24_id, cafe24_pw, file_bytes, file_
 
         # 업로드 화면에 진입한 직후에도 안내 팝업(예: "전용 엑셀양식 다운로드")이 새로
         # 뜨는 경우가 있어, 파일을 첨부하기 전에 한 번 더 정리합니다.
-        _close_popups(context, page)
+        _close_popups(context, page, dialog_messages=dialog_messages,
+                      popup_page_log=popup_page_log, click_state=click_state)
 
         # 리눅스(Streamlit Cloud)에는 항상 있는 /tmp가 Windows에는 존재하지 않아,
         # 하드코딩된 "/tmp/..." 경로로 파일을 쓰면 Windows 로컬 실행에서
@@ -415,7 +586,7 @@ def upload_one_account(playwright, name, cafe24_id, cafe24_pw, file_bytes, file_
                 name=name, status="error",
                 message="업로드 파일 입력창을 찾지 못했습니다 (페이지 구조가 예상과 다를 수 있습니다).",
                 screenshot=shot,
-                network_log=network_log, console_log=console_log,
+                network_log=network_log, console_log=console_log, popup_page_log=popup_page_log,
             )
 
         # 파일을 방금 첨부한 직후에는, 화면이 파일을 검증/미리보기 처리하는 중이라
@@ -474,7 +645,8 @@ def upload_one_account(playwright, name, cafe24_id, cafe24_pw, file_bytes, file_
                 break
             except Exception as e:
                 click_error = e
-                _close_popups(context, page)
+                _close_popups(context, page, dialog_messages=dialog_messages,
+                              popup_page_log=popup_page_log, click_state=click_state)
                 time.sleep(0.5)
 
         if click_error is not None:
@@ -490,7 +662,7 @@ def upload_one_account(playwright, name, cafe24_id, cafe24_pw, file_bytes, file_
                 name=name, status="error", message=msg, screenshot=shot,
                 screenshot_before_click=screenshot_before_click,
                 button_html_before=button_html_before,
-                network_log=network_log, console_log=console_log,
+                network_log=network_log, console_log=console_log, popup_page_log=popup_page_log,
             )
 
         # 클릭 직후 버튼 자체의 HTML(문구/활성화 상태 등)도 함께 남겨서, 클릭 전과
@@ -583,14 +755,34 @@ def upload_one_account(playwright, name, cafe24_id, cafe24_pw, file_bytes, file_
                 "함께 확인해주세요."
             )
         elif submit_request_sent and submit_response_entry is None:
-            diagnosis = (
-                f"🔴 실제 업로드 처리 요청(서버로 \"{UPLOAD_SUBMIT_URL_HINT}\" 요청)은 정상적으로 "
-                f"전송됐지만, {submit_wait_sec}초를 기다려도 응답을 받지 못했습니다 — 지금까지 "
-                "반복된 문제의 가장 유력한 원인으로 보입니다. 상품 수가 아주 많아 서버 처리가 "
-                "이 시간보다 더 오래 걸리거나, 서버와의 연결이 중간에 끊어졌을 가능성이 있습니다. "
-                "'③'에서 대기 시간을 더 늘려서 다시 시도해보시거나, 그래도 안 되면 이 로그를 "
-                "그대로 알려주세요 — 대기 시간 문제가 아니라는 뜻이므로 다른 원인을 찾아야 합니다."
-            )
+            # (2026-08-27 추가) 응답이 안 온 게 "서버가 느린 것"인지 "요청 자체가 중간에
+            # 끊어진 것"인지 requestfailed 로그로 구분합니다 — 특히 팝업 페이지에서 확인
+            # 버튼을 누른 뒤 그 페이지가 (우리 코드에 의해서든 다른 이유로든) 닫히면
+            # 요청이 중단될 수 있는데, 이 경우는 대기 시간을 아무리 늘려도 해결되지
+            # 않으므로 서로 다른 안내가 필요합니다.
+            submit_failed_entries = [
+                e for e in network_log
+                if e["phase"] == "클릭 후" and e["kind"] == "요청실패"
+                and UPLOAD_SUBMIT_URL_HINT in e.get("url", "")
+            ]
+            if submit_failed_entries:
+                fail_errs = ", ".join(sorted({str(e.get("error") or "알 수 없는 오류") for e in submit_failed_entries}))
+                diagnosis = (
+                    f"🔴 실제 업로드 처리 요청(\"{UPLOAD_SUBMIT_URL_HINT}\")은 전송됐지만, 응답을 받기 "
+                    f"전에 요청 자체가 중간에 끊어졌습니다 ({fail_errs}). 이건 '서버가 느려서'가 "
+                    "아니라 '요청이 중단됨'이라는 뜻이라 대기 시간을 늘려도 해결되지 않습니다 — "
+                    "아래 '팝업 페이지 처리 로그'에 이 시점에 페이지가 닫힌 기록이 있는지 꼭 "
+                    "확인해주세요."
+                )
+            else:
+                diagnosis = (
+                    f"🔴 실제 업로드 처리 요청(서버로 \"{UPLOAD_SUBMIT_URL_HINT}\" 요청)은 정상적으로 "
+                    f"전송됐지만, {submit_wait_sec}초를 기다려도 응답을 받지 못했습니다 — 지금까지 "
+                    "반복된 문제의 가장 유력한 원인으로 보입니다. 상품 수가 아주 많아 서버 처리가 "
+                    "이 시간보다 더 오래 걸리거나, 서버와의 연결이 중간에 끊어졌을 가능성이 있습니다. "
+                    "'③'에서 대기 시간을 더 늘려서 다시 시도해보시거나, 그래도 안 되면 이 로그를 "
+                    "그대로 알려주세요 — 대기 시간 문제가 아니라는 뜻이므로 다른 원인을 찾아야 합니다."
+                )
         elif submit_response_status is not None and submit_response_status >= 400:
             diagnosis = (
                 f"🟠 실제 업로드 처리 요청은 서버로 전달됐지만 오류 응답({submit_response_status})을 "
@@ -633,6 +825,7 @@ def upload_one_account(playwright, name, cafe24_id, cafe24_pw, file_bytes, file_
                 diagnosis=diagnosis, network_log=network_log, console_log=console_log,
                 button_html_before=button_html_before, button_html_after=button_html_after,
                 submit_request_sent=submit_request_sent, submit_response_status=submit_response_status,
+                popup_page_log=popup_page_log,
             )
 
         dialog_note = f" (자동 승인한 확인창: {' / '.join(dialog_messages)})" if dialog_messages else ""
@@ -654,6 +847,7 @@ def upload_one_account(playwright, name, cafe24_id, cafe24_pw, file_bytes, file_
                 diagnosis=diagnosis, network_log=network_log, console_log=console_log,
                 button_html_before=button_html_before, button_html_after=button_html_after,
                 submit_request_sent=submit_request_sent, submit_response_status=submit_response_status,
+                popup_page_log=popup_page_log,
             )
 
         return AccountResult(
@@ -667,6 +861,7 @@ def upload_one_account(playwright, name, cafe24_id, cafe24_pw, file_bytes, file_
             diagnosis=diagnosis, network_log=network_log, console_log=console_log,
             button_html_before=button_html_before, button_html_after=button_html_after,
             submit_request_sent=submit_request_sent, submit_response_status=submit_response_status,
+            popup_page_log=popup_page_log,
         )
 
     except Exception as e:
@@ -678,6 +873,7 @@ def upload_one_account(playwright, name, cafe24_id, cafe24_pw, file_bytes, file_
             diagnosis=diagnosis,
             network_log=network_log, console_log=console_log,
             button_html_before=button_html_before, button_html_after=button_html_after,
+            popup_page_log=popup_page_log,
         )
     finally:
         try:
