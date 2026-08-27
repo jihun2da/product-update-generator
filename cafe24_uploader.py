@@ -202,15 +202,28 @@ def upload_one_account(playwright, name, cafe24_id, cafe24_pw, file_bytes, file_
     try:
         browser = playwright.chromium.launch(headless=headless, args=["--no-sandbox"])
         context = browser.new_context(accept_downloads=False)
-        page = context.new_page()
 
         # 카페24는 업로드 버튼을 누르면 브라우저 네이티브 확인창(예: "해당 파일을
         # 업로드 하시겠습니까?")을 띄웁니다. Playwright는 이런 다이얼로그를 처리하는
         # 핸들러가 없으면 기본적으로 자동 "취소" 처리를 해버려서, 실제로는 업로드가
-        # 진행되지 않았는데도 그대로 넘어가 버리는 문제가 있었습니다(실사용 테스트 중
-        # 확인 — 팝업은 잘 닫혔지만 그 다음 뜨는 이 확인창 때문에 업로드가 취소되고
-        # 있었습니다). 페이지 생성 직후부터 등록해두어, 어떤 시점에 다이얼로그가 뜨든
-        # 항상 "확인"을 누른 것과 동일하게 자동으로 승인(accept)합니다.
+        # 진행되지 않았는데도 그대로 넘어가 버리는 문제가 있었습니다.
+        #
+        # ⚠️ (2026-08-27) 사용자가 실제 화면에서 이 확인창을 캡처해서 보내주셨는데,
+        # "확인"을 눌러야 업로드가 진행되는데도 계속 그냥 닫히기만(취소) 한다는 문제가
+        # 재현/확인됐습니다. 원인을 로컬 테스트로 직접 재현해서 찾았습니다 — 카페24
+        # 관리자 화면은 실제로 새 탭/팝업 페이지가 뜨는 경우가 있는데(바로 아래
+        # _close_popups()가 "다른 페이지"를 닫는 이유이기도 합니다), 이 확인창이 원래
+        # page가 아니라 그런 새 팝업 페이지 쪽에서 뜨는 경우, "그 page 객체"에 다이얼로그
+        # 핸들러가 등록돼 있지 않으면 Playwright가 즉시 자동으로 "취소" 처리해버립니다
+        # — 이게 정확히 사용자가 겪은 증상(확인창이 뜨자마자 그냥 닫힘)과 일치한다는
+        # 것을 로컬 재현 테스트로 확인했습니다. 처음에는 새로 생기는 페이지마다
+        # context.on("page", ...)로 개별 등록하는 방식을 시도했지만, 팝업이 뜨자마자
+        # (페이지 로드 중 곧바로) 확인창을 띄우는 경우 그 등록이 다이얼로그 발생 시점을
+        # 놓치는 경쟁 상태(race condition)가 실제로 재현됐습니다. 대신 컨텍스트 자체에
+        # 다이얼로그 핸들러를 등록하면(Playwright 1.56+에서 지원) 이 컨텍스트에 속한
+        # 모든 페이지(메인 페이지 + 이후 생기는 모든 팝업)의 다이얼로그를 등록 시점과
+        # 무관하게 놓치지 않고 잡아낸다는 것을 로컬 테스트로 확인했고, 이렇게 수정해
+        # 실제 업로드 요청(ProductExcelSet)까지 정상적으로 나가는 것을 재검증했습니다.
         dialog_messages = []
 
         def _handle_dialog(dialog):
@@ -223,7 +236,9 @@ def upload_one_account(playwright, name, cafe24_id, cafe24_pw, file_bytes, file_
             except Exception:
                 pass
 
-        page.on("dialog", _handle_dialog)
+        context.on("dialog", _handle_dialog)
+
+        page = context.new_page()
 
         # "업로드 버튼을 눌렀는데 실제로 반영이 안 된다"는 문제가 대기 시간을 늘려도
         # 계속 재현돼서, 더 이상 추측으로 고치지 않고 실제로 무슨 일이 일어나는지
@@ -233,6 +248,14 @@ def upload_one_account(playwright, name, cafe24_id, cafe24_pw, file_bytes, file_
         # 안 했다는 뜻이고, 요청은 갔는데 오류 응답이면 서버 쪽 문제라는 뜻이므로
         # 완전히 다른 해결책이 필요합니다. 이 정보는 화면 "④ 업로드 결과"의
         # "진단 정보"에서 그대로 확인할 수 있습니다.
+        #
+        # ⚠️ (2026-08-27) 위 다이얼로그 핸들러와 같은 이유로, 이 계측도 원래 page
+        # 하나에만 등록돼 있으면 실제 업로드 요청이 팝업 페이지 쪽에서 발생하는 경우
+        # 완전히 놓치게 됩니다(로컬 재현 테스트로 확인 — 다이얼로그는 정상적으로
+        # "확인" 처리됐는데도 진단은 여전히 "요청이 전혀 없었다"로 잘못 나오는 것을
+        # 직접 봤습니다). 다이얼로그와 마찬가지로 page 대신 context 레벨에 등록해서,
+        # 메인 페이지든 이후 생기는 어떤 팝업이든 상관없이 콘솔/요청/응답을 전부
+        # 놓치지 않고 기록하도록 수정했습니다.
         click_state = {"clicked": False}
 
         def _handle_console(msg):
@@ -265,9 +288,9 @@ def upload_one_account(playwright, name, cafe24_id, cafe24_pw, file_bytes, file_
             except Exception:
                 pass
 
-        page.on("console", _handle_console)
-        page.on("request", _handle_request)
-        page.on("response", _handle_response)
+        context.on("console", _handle_console)
+        context.on("request", _handle_request)
+        context.on("response", _handle_response)
 
         page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=nav_timeout_ms)
         page.locator(ID_XPATH).fill(cafe24_id)
