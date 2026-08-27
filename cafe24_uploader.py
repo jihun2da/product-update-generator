@@ -19,6 +19,7 @@ import asyncio
 import os
 import sys
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass
 from typing import Optional, List, Callable
@@ -224,7 +225,17 @@ def upload_one_account(playwright, name, cafe24_id, cafe24_pw, file_bytes, file_
         # 뜨는 경우가 있어, 파일을 첨부하기 전에 한 번 더 정리합니다.
         _close_popups(context, page)
 
-        temp_path = f"/tmp/_cafe24_upload_{name}_{os.getpid()}.xlsx"
+        # 리눅스(Streamlit Cloud)에는 항상 있는 /tmp가 Windows에는 존재하지 않아,
+        # 하드코딩된 "/tmp/..." 경로로 파일을 쓰면 Windows 로컬 실행에서
+        # "[Errno 2] No such file or directory" 오류가 났습니다(실사용 테스트 중
+        # 확인). OS에 맞는 임시 폴더를 알아서 찾아주는 tempfile.gettempdir()를
+        # 사용하도록 수정 — Windows에서는 사용자 임시 폴더, 리눅스에서는 기존과 동일하게
+        # /tmp를 사용합니다. 계정 이름에 경로 구분자가 섞여 있어도 안전하도록 파일명도
+        # 정리합니다.
+        safe_name = "".join(c for c in name if c not in '\\/:*?"<>|') or "account"
+        temp_path = os.path.join(
+            tempfile.gettempdir(), f"_cafe24_upload_{safe_name}_{os.getpid()}.xlsx"
+        )
         with open(temp_path, "wb") as f:
             f.write(file_bytes)
 
