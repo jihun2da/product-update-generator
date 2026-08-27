@@ -46,6 +46,11 @@ class AccountResult:
     status: str  # 'success' | 'fail' | 'login_fail' | 'error'
     message: str = ""
     screenshot: Optional[bytes] = None
+    # 업로드 버튼을 누르기 직전 / 직후 화면도 함께 남겨서, "버튼 클릭이 실제로
+    # 무언가를 했는지"를 화면 3장(클릭 전 / 클릭 직후 / 최종)으로 비교 확인할 수
+    # 있게 합니다. 실패 원인 진단용이며, 못 찍었을 때는 None입니다.
+    screenshot_before_click: Optional[bytes] = None
+    screenshot_after_click: Optional[bytes] = None
 
 
 def ensure_chromium_installed(status_cb: Optional[Callable[[str], None]] = None):
@@ -155,6 +160,8 @@ def upload_one_account(playwright, name, cafe24_id, cafe24_pw, file_bytes, file_
     경우에는 볼 화면이 없어 무한 대기하게 되므로 이 옵션을 무시합니다."""
     browser = None
     page = None
+    screenshot_before_click = None
+    screenshot_after_click = None
     try:
         browser = playwright.chromium.launch(headless=headless, args=["--no-sandbox"])
         context = browser.new_context(accept_downloads=False)
@@ -270,6 +277,26 @@ def upload_one_account(playwright, name, cafe24_id, cafe24_pw, file_bytes, file_
                 screenshot=shot,
             )
 
+        # 파일을 방금 첨부한 직후에는, 화면이 파일을 검증/미리보기 처리하는 중이라
+        # "#dropZone" 버튼이 아직 "파일찾기"(파일 선택) 상태에서 "업로드"(업로드 시작)
+        # 상태로 완전히 바뀌지 않았을 수 있습니다. 이 상태에서 바로 버튼을 누르면 클릭
+        # 자체는 예외 없이 "성공"하지만, 실제로는 파일 선택창을 다시 여는 것과 같은
+        # 동작만 하고 서버 업로드는 전혀 시작되지 않을 수 있습니다 — 화면(진행중)에는
+        # 파일이 100%로 붙어있는 것처럼 보이는데 실제 업로드 이력에는 아무것도 안 남는,
+        # 실사용 중 반복 확인된 증상과 정확히 일치합니다. 로컬 재현 테스트로 확인한
+        # 문제이며, 버튼을 누르기 전에 먼저 (1) 파일 검증 관련 네트워크 활동이 잠잠해질
+        # 때까지 짧게 기다리고 (2) 화면이 완전히 전환될 여유를 위해 추가로 잠깐 더
+        # 기다립니다(둘 다 실패해도 예외를 삼키고 그냥 진행 — 무한 대기 방지).
+        try:
+            page.wait_for_load_state("networkidle", timeout=8000)
+        except PlaywrightTimeoutError:
+            pass
+        except Exception:
+            pass
+        time.sleep(1.5)
+
+        screenshot_before_click = _safe_screenshot(page)
+
         # 파일 첨부 후 새로 뜬 팝업이 업로드 버튼을 가릴 수 있어 한 번 더 정리한 뒤
         # 클릭합니다. 클릭 자체가 끝까지 실패하면(예: 팝업에 가려져 클릭이 막히는 경우)
         # 예외를 조용히 무시하고 넘어가지 않습니다 — 그렇게 하면 실제로는 업로드 버튼이
@@ -296,7 +323,12 @@ def upload_one_account(playwright, name, cafe24_id, cafe24_pw, file_bytes, file_
             else:
                 msg += f" ({click_error})"
             msg += " — 이 계정은 재시도하지 않았습니다. 스크린샷을 확인해주세요."
-            return AccountResult(name=name, status="error", message=msg, screenshot=shot)
+            return AccountResult(
+                name=name, status="error", message=msg, screenshot=shot,
+                screenshot_before_click=screenshot_before_click,
+            )
+
+        screenshot_after_click = _safe_screenshot(page)
 
         # 업로드 버튼 클릭(및 확인창 승인) 직후, 실제 서버 처리가 끝나기 전에 브라우저를
         # 닫아버리면 파일이 화면에는 "진행중 100%"로 붙어 있는 것처럼 보여도 실제로는
@@ -329,7 +361,11 @@ def upload_one_account(playwright, name, cafe24_id, cafe24_pw, file_bytes, file_
         combined_text = body_text + " " + " ".join(dialog_messages)
 
         if any(kw in combined_text for kw in FAIL_KEYWORDS):
-            return AccountResult(name=name, status="fail", message="업로드 실패 문구가 감지됐습니다.", screenshot=shot)
+            return AccountResult(
+                name=name, status="fail", message="업로드 실패 문구가 감지됐습니다.", screenshot=shot,
+                screenshot_before_click=screenshot_before_click,
+                screenshot_after_click=screenshot_after_click,
+            )
 
         dialog_note = f" (자동 승인한 확인창: {' / '.join(dialog_messages)})" if dialog_messages else ""
         return AccountResult(
@@ -337,11 +373,17 @@ def upload_one_account(playwright, name, cafe24_id, cafe24_pw, file_bytes, file_
             message="업로드 시도 완료 (자동 판별 결과이므로, 스크린샷으로 실제 반영 여부를 확인해주세요)"
             + dialog_note,
             screenshot=shot,
+            screenshot_before_click=screenshot_before_click,
+            screenshot_after_click=screenshot_after_click,
         )
 
     except Exception as e:
         shot = _safe_screenshot(page) if page is not None else None
-        return AccountResult(name=name, status="error", message=str(e), screenshot=shot)
+        return AccountResult(
+            name=name, status="error", message=str(e), screenshot=shot,
+            screenshot_before_click=screenshot_before_click,
+            screenshot_after_click=screenshot_after_click,
+        )
     finally:
         try:
             if browser:
