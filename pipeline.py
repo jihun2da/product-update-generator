@@ -105,6 +105,134 @@ class PipelineError(Exception):
 
 
 # =========================================================
+# 판매처 파일 삭제/추가 (사용자가 앱 화면에서 직접 설정)
+# =========================================================
+
+# "삭제"(생성 제외) 화면에 노출할 기본 항목들.
+# - DEFAULT_STAGE1_VENDOR_STYLE_FILES: 1단계(예제생성) 결과물 중, 다른 단계의 입력으로
+#   쓰이지 않고 그 자체로 최종 산출물인 "판매처 스타일" 파일들만 포함합니다(곽충현/문정희).
+#   예제.xlsx/기린.xlsx/날짜파일/두두사사.xlsx/S파일/카테고리번호.xlsx는 다음 단계 계산에
+#   반드시 필요한 파이프라인 내부 산출물이라 제외 대상에 넣지 않습니다.
+# - DEFAULT_STAGE2_VENDORS: 2단계 판매처별 파일 18개 중, X{날짜}.xlsx는 스마트스토어(N파일)
+#   변환의 원본 데이터로 내부적으로 반드시 필요해 제외 대상에서 뺐습니다.
+DEFAULT_STAGE1_VENDOR_STYLE_FILES = ['곽충현', '문정희']
+
+DEFAULT_STAGE2_VENDORS = [
+    '김하늘', '서송이', '이지민', '해피', '김다혜', '박미리',
+    '오토', '오마베', '최민기', '현건주', '목윤희', '최은경', '남부센',
+    '백종열', '백성희', '모나마켓', '이모이모',
+]
+
+ALL_OPTIONAL_VENDOR_NAMES = DEFAULT_STAGE1_VENDOR_STYLE_FILES + DEFAULT_STAGE2_VENDORS
+
+
+def _style_name_2ban(name):
+    """2번시트 스타일: 상품명을 그대로 둡니다(김하늘/서송이/이지민/해피/김다혜와 동일)."""
+    return name
+
+
+def _style_name_3ban(name):
+    """3번시트 스타일: 'KC'까지(포함) 앞부분 삭제 + '<' 이후 삭제 + 공백 제거 (박미리와 동일)."""
+    s = str(name)
+    s = re.sub(r'.*KC', '', s)
+    idx = s.find('<')
+    if idx != -1:
+        s = s[:idx]
+    s = s.replace(' ', '')
+    return s
+
+
+def _style_name_5ban(name):
+    """5번시트 스타일: '<' 이후 삭제 + 'KC' 제거 (오토/오마베/최민기 등과 동일)."""
+    s = str(name)
+    s = re.sub(r'<.*', '', s)
+    s = s.replace('KC', '')
+    return s
+
+
+# 새 판매처 파일을 추가할 때 선택할 수 있는 스타일 목록.
+# key는 UI/저장 설정에서 쓰는 식별자, 'sheet'는 생성될 시트 이름, 'name_fn'은 상품명 가공 함수,
+# 'label'은 화면에 보여줄 설명입니다. 기존 판매처들의 가격 재계산(김하늘)이나 적립금 삭제
+# (서송이), 진열상태 변경(모나마켓) 같은 개별 특수 규칙은 판매처마다 달라 일반화하지 않고,
+# 상품명 처리 스타일(2/3/5번시트)만 선택하도록 했습니다.
+VENDOR_STYLE_INFO = {
+    '2번시트': {
+        'label': '2번시트 스타일 — 상품명 그대로 복사 (김하늘/서송이/이지민 등과 동일)',
+        'sheet': '2번시트',
+        'name_fn': _style_name_2ban,
+    },
+    '3번시트': {
+        'label': "3번시트 스타일 — 상품명에서 'KC' 앞부분 삭제 + '<' 이후 삭제 + 공백 제거 (박미리와 동일)",
+        'sheet': '3번시트',
+        'name_fn': _style_name_3ban,
+    },
+    '5번시트': {
+        'label': "5번시트 스타일 — 상품명에서 '<' 이후 삭제 + 'KC' 제거 (오토/오마베 등과 동일)",
+        'sheet': '5번시트',
+        'name_fn': _style_name_5ban,
+    },
+}
+
+DEFAULT_VENDOR_STYLE = '2번시트'
+
+
+def add_vendor_category_column(category_bytes, vendor_name, value):
+    """카테고리번호.xlsx에 vendor_name과 같은 이름의 헤더(1행) 컬럼이 있으면 재사용하고,
+    없으면 새로 추가합니다. '원본'(A열) 값이 있는 모든 데이터 행에 value를 동일하게
+    채워 넣습니다(판매처마다 원본 코드별로 다른 값을 매핑하는 기존 방식과 달리,
+    신규 판매처는 우선 모든 코드에 같은 값 하나로 시작합니다 — 이후 코드별로 세분화가
+    필요하면 카테고리번호.xlsx를 직접 열어 행별로 값을 다르게 수정하면 됩니다).
+
+    반환: (new_bytes, 실제 사용된 컬럼 이름, 새로 만든 컬럼인지 여부)
+    """
+    wb = load_wb(category_bytes, data_only=False)
+    ws = wb.active
+
+    header_col = None
+    for c in range(1, ws.max_column + 1):
+        if safe_str(ws.cell(row=1, column=c).value).strip() == vendor_name:
+            header_col = c
+            break
+
+    is_new = header_col is None
+    if header_col is None:
+        header_col = ws.max_column + 1
+        ws.cell(row=1, column=header_col).value = vendor_name
+
+    for r in range(2, ws.max_row + 1):
+        if ws.cell(row=r, column=1).value in (None, ''):
+            continue
+        ws.cell(row=r, column=header_col).value = value
+
+    return wb_bytes(wb), vendor_name, is_new
+
+
+def add_custom_vendor_files(outputs, df_dudu, custom_vendors, column_name='상품명'):
+    """custom_vendors: [{'name': str, 'style': '2번시트'|'3번시트'|'5번시트'}, ...]
+
+    두두사사 데이터를 선택한 스타일로 상품명만 정리해서 새 판매처 파일을 추가로
+    생성합니다(가격 재계산 등 개별 특수 규칙은 적용하지 않는, 순수 스타일 복사본).
+    이미 같은 이름의 파일이 있으면 덮어쓰지 않고 경고만 남깁니다.
+    """
+    warnings = []
+    for cv in custom_vendors:
+        name = safe_str(cv.get('name')).strip()
+        style = cv.get('style') or DEFAULT_VENDOR_STYLE
+        if not name:
+            continue
+        fname = f'{name}.xlsx'
+        if fname in outputs:
+            warnings.append(f"'{fname}'은 이미 기존 판매처 파일과 이름이 겹쳐 새로 추가하지 않았습니다.")
+            continue
+        info = VENDOR_STYLE_INFO.get(style, VENDOR_STYLE_INFO[DEFAULT_VENDOR_STYLE])
+        df_new = df_dudu.copy()
+        if column_name in df_new.columns:
+            df_new[column_name] = df_new[column_name].astype(str).apply(info['name_fn'])
+        outputs[fname] = df_to_xlsx_bytes(df_new, sheet_name=info['sheet'])
+    return outputs, warnings
+
+
+# =========================================================
 # 0단계: 기린 -> S파일 열 복사, 곽충현/문정희 스냅샷, 예제 상태 생성
 # =========================================================
 
@@ -447,7 +575,12 @@ def update_category_file(category_bytes, new_code, target_row=29):
 # 2단계: 자동업데이트파일생성(2026).py 로직
 # =========================================================
 
-def process_cafe24(dudu_bytes, today_str):
+def process_cafe24(dudu_bytes, today_str, excluded=None):
+    """excluded: 생성하지 않을 판매처 이름(확장자 제외) 집합/리스트. None이면 기존과 동일하게
+    18개 판매처 전부 생성합니다. X{today_str}.xlsx는 스마트스토어(N파일) 변환에 내부적으로
+    필요해 excluded에 포함돼도 항상 생성됩니다(다운로드 목록 노출 여부와 무관)."""
+    excluded = set(excluded or [])
+
     df = pd.read_excel(io.BytesIO(dudu_bytes), dtype=str)
     column_name = '상품명'
 
@@ -460,21 +593,25 @@ def process_cafe24(dudu_bytes, today_str):
     df_sheet2 = df.copy()
 
     # 김하늘: 소비자가(T열)/판매가(V열) = 공급가(U열) * 1.7
-    df_kim_haneul = df_sheet2.copy()
-    if all(c in df_kim_haneul.columns for c in ['소비자가', '공급가', '판매가']):
-        supply_numeric = pd.to_numeric(df_kim_haneul['공급가'], errors='coerce')
-        computed_price = (supply_numeric * 1.7).round()
-        df_kim_haneul['소비자가'] = computed_price
-        df_kim_haneul['판매가'] = computed_price
-    outputs['김하늘.xlsx'] = df_to_xlsx_bytes(df_kim_haneul, sheet_name="2번시트")
+    if '김하늘' not in excluded:
+        df_kim_haneul = df_sheet2.copy()
+        if all(c in df_kim_haneul.columns for c in ['소비자가', '공급가', '판매가']):
+            supply_numeric = pd.to_numeric(df_kim_haneul['공급가'], errors='coerce')
+            computed_price = (supply_numeric * 1.7).round()
+            df_kim_haneul['소비자가'] = computed_price
+            df_kim_haneul['판매가'] = computed_price
+        outputs['김하늘.xlsx'] = df_to_xlsx_bytes(df_kim_haneul, sheet_name="2번시트")
 
     # 서송이: 적립금(AB열) 값을 모두 비움
-    df_seo = df_sheet2.copy()
-    if '적립금' in df_seo.columns:
-        df_seo['적립금'] = None
-    outputs['서송이.xlsx'] = df_to_xlsx_bytes(df_seo, sheet_name="2번시트")
+    if '서송이' not in excluded:
+        df_seo = df_sheet2.copy()
+        if '적립금' in df_seo.columns:
+            df_seo['적립금'] = None
+        outputs['서송이.xlsx'] = df_to_xlsx_bytes(df_seo, sheet_name="2번시트")
 
     for name in ['이지민', '해피', '김다혜']:
+        if name in excluded:
+            continue
         outputs[f'{name}.xlsx'] = df_to_xlsx_bytes(df_sheet2, sheet_name="2번시트")
 
     # 3번시트 그룹
@@ -486,6 +623,8 @@ def process_cafe24(dudu_bytes, today_str):
         .str.replace(' ', '', regex=False)
     )
     for name in ['박미리']:
+        if name in excluded:
+            continue
         outputs[f'{name}.xlsx'] = df_to_xlsx_bytes(df_sheet3, sheet_name="3번시트")
 
     # 5번시트 그룹
@@ -496,20 +635,23 @@ def process_cafe24(dudu_bytes, today_str):
         .str.replace('KC', '', regex=False)
     )
     for name in ['오토', '오마베', '최민기', '현건주', '목윤희', '최은경', '남부센']:
+        if name in excluded:
+            continue
         outputs[f'{name}.xlsx'] = df_to_xlsx_bytes(df_sheet5, sheet_name="5번시트")
 
     # 백종열.xlsx
-    df_baek = df_sheet5.copy()
-    o_column = '상품 상세설명'
-    if o_column in df_baek.columns:
-        df_baek[o_column] = (
-            '<p align=center><img src="https://mododome.diskn.com/p7Mch6ng1C" /><br><br></p>'
-            + df_baek[o_column].astype(str)
-            + '<p align=center><img src="https://mododome.diskn.com/r7Mch6n6Ee" /><br><br></p>'
-        )
-    outputs['백종열.xlsx'] = df_to_xlsx_bytes(df_baek, sheet_name="5번시트")
+    if '백종열' not in excluded:
+        df_baek = df_sheet5.copy()
+        o_column = '상품 상세설명'
+        if o_column in df_baek.columns:
+            df_baek[o_column] = (
+                '<p align=center><img src="https://mododome.diskn.com/p7Mch6ng1C" /><br><br></p>'
+                + df_baek[o_column].astype(str)
+                + '<p align=center><img src="https://mododome.diskn.com/r7Mch6n6Ee" /><br><br></p>'
+            )
+        outputs['백종열.xlsx'] = df_to_xlsx_bytes(df_baek, sheet_name="5번시트")
 
-    # X파일
+    # X파일 (스마트스토어 N파일 변환의 원본 데이터로 내부적으로 필요해 항상 생성)
     x_filename = f'X{today_str}.xlsx'
     outputs[x_filename] = df_to_xlsx_bytes(df_sheet5, sheet_name="5번시트")
 
@@ -524,10 +666,13 @@ def process_cafe24(dudu_bytes, today_str):
         .str.replace(r'<.*', '', regex=True)
         .str.replace('KC', '', regex=False)
     )
-    outputs['백성희.xlsx'] = df_to_xlsx_bytes(df_modified, sheet_name="5번시트")
+    if '백성희' not in excluded:
+        outputs['백성희.xlsx'] = df_to_xlsx_bytes(df_modified, sheet_name="5번시트")
 
     # 모나마켓: 진열상태(C열)/판매상태(D열)을 N으로 생성
     for label in ['모나마켓']:
+        if label in excluded:
+            continue
         df_choi = df_modified.copy()
         if '진열상태' in df_choi.columns:
             df_choi['진열상태'] = 'N'
@@ -540,13 +685,14 @@ def process_cafe24(dudu_bytes, today_str):
     # 2단계에서는 별도로 만들지 않습니다 (중복/덮어쓰기 방지).
 
     # 이모이모.xlsx
-    df_sheet6 = df.copy()
-    df_sheet6[column_name] = (
-        df_sheet6[column_name].astype(str)
-        .str.replace(r'<.*', '', regex=True)
-        .str.replace('KC', '', regex=False)
-    )
-    outputs['이모이모.xlsx'] = df_to_xlsx_bytes(df_sheet6, sheet_name="6번시트")
+    if '이모이모' not in excluded:
+        df_sheet6 = df.copy()
+        df_sheet6[column_name] = (
+            df_sheet6[column_name].astype(str)
+            .str.replace(r'<.*', '', regex=True)
+            .str.replace('KC', '', regex=False)
+        )
+        outputs['이모이모.xlsx'] = df_to_xlsx_bytes(df_sheet6, sheet_name="6번시트")
 
     return outputs, df, x_filename
 
@@ -933,8 +1079,18 @@ def run_pipeline(
     next_sfile_date=None,
     category_row=29,
     smartstore_target_col='스마트오토',
+    excluded_vendors=None,
+    custom_vendors=None,
 ):
     """전체 파이프라인 실행.
+
+    excluded_vendors: 생성하지 않을 판매처 이름(확장자 제외) 목록/집합. 곽충현/문정희(1단계)와
+        18개 판매처 파일(2단계, X파일 제외) 중에서 고를 수 있습니다.
+    custom_vendors: 새로 추가할 판매처 목록. 각 항목은
+        {'name': str, 'style': '2번시트'|'3번시트'|'5번시트', 'category_value': str} 형태이며,
+        두두사사 데이터를 선택한 스타일로 상품명만 정리한 새 판매처 파일을 만들고,
+        category_value가 있으면 카테고리번호.xlsx에 그 이름의 컬럼을 추가(또는 재사용)해
+        모든 행에 같은 값을 채웁니다.
 
     반환: {
         'stage1': {파일명: bytes, ...},   # 예제/새기린/날짜파일/두두사사/다음S파일/카테고리번호/곽충현/문정희
@@ -947,6 +1103,9 @@ def run_pipeline(
     """
     logs = []
     errors = []
+
+    excluded_vendors = set(excluded_vendors or [])
+    custom_vendors = list(custom_vendors or [])
 
     today_str = datetime.today().strftime('%Y%m%d')
     dated_str = dated_filename_date or today_str
@@ -976,6 +1135,24 @@ def run_pipeline(
     else:
         category_bytes_updated = category_bytes
 
+    # 새로 추가하는 판매처가 있으면, 카테고리 매핑표(mapping_df)를 읽기 전에 먼저
+    # 카테고리번호.xlsx에 해당 판매처 컬럼을 추가/갱신해둡니다 — 그래야 바로 아래에서
+    # mapping_df를 다시 읽을 때 새 컬럼이 함께 반영되어, 2단계 카테고리 매핑이 이 신규
+    # 판매처 파일에도 자동으로 적용됩니다.
+    for cv in custom_vendors:
+        cv_name = safe_str(cv.get('name')).strip()
+        cv_value = cv.get('category_value')
+        if not cv_name or cv_value in (None, ''):
+            continue
+        category_bytes_updated, used_name, is_new = add_vendor_category_column(
+            category_bytes_updated, cv_name, cv_value
+        )
+        logs.append(
+            f"카테고리번호.xlsx에 '{used_name}' 컬럼을 "
+            + ("새로 추가하고" if is_new else "기존 컬럼을 그대로 사용해서")
+            + f" 모든 행에 '{cv_value}' 값을 채웠습니다."
+        )
+
     stage1 = {
         '예제.xlsx': state['example_bytes'],
         '기린.xlsx': kirin_bytes_new,
@@ -983,9 +1160,11 @@ def run_pipeline(
         '두두사사.xlsx': dudu_bytes,
         f'S{next_s_str}.xlsx': next_sfile_bytes,
         '카테고리번호.xlsx': category_bytes_updated,
-        '곽충현.xlsx': state['kwak_bytes'],
-        '문정희.xlsx': state['moon_bytes'],
     }
+    if '곽충현' not in excluded_vendors:
+        stage1['곽충현.xlsx'] = state['kwak_bytes']
+    if '문정희' not in excluded_vendors:
+        stage1['문정희.xlsx'] = state['moon_bytes']
 
     # 2단계 (자동업데이트파일생성 2026)
     try:
@@ -1000,7 +1179,7 @@ def run_pipeline(
 
     stage2 = {}
     try:
-        outputs, df_dudu, x_filename = process_cafe24(dudu_bytes, today_str)
+        outputs, df_dudu, x_filename = process_cafe24(dudu_bytes, today_str, excluded=excluded_vendors)
         stage2.update(outputs)
 
         n_file_info = []
@@ -1025,6 +1204,13 @@ def run_pipeline(
                 errors.append(f"스마트스토어(N파일) 변환 중 오류: {e}")
         else:
             logs.append("스마트스토어기본.xlsx 템플릿이 제공되지 않아 N파일(스마트스토어 변환) 생성을 건너뛰었습니다.")
+
+        # 새로 추가하는 판매처 파일들을 여기서 만들어 둡니다 — 아래 apply_category_mapping이
+        # stage2에 있는 모든 파일을 대상으로 카테고리 매핑을 적용하므로, 매핑 적용 "전"에
+        # 추가해야 새 판매처 파일에도 자동으로 카테고리 매핑이 반영됩니다.
+        if custom_vendors:
+            stage2, custom_vendor_warnings = add_custom_vendor_files(stage2, df_dudu, custom_vendors)
+            logs += custom_vendor_warnings
 
         if mapping_df is not None:
             stage2, map_warnings = apply_category_mapping(

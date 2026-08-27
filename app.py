@@ -1,5 +1,6 @@
 import base64
 import io
+import json
 import zipfile
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -11,6 +12,7 @@ import pipeline as pl
 
 ASSET_CATEGORY_PATH = Path(__file__).parent / "카테고리번호_기본.xlsx"
 ASSET_TEMPLATE_PATH = Path(__file__).parent / "스마트스토어기본_기본.xlsx"
+ASSET_VENDOR_CONFIG_PATH = Path(__file__).parent / "판매처설정_기본.json"
 
 GITHUB_OWNER = "jihun2da"
 GITHUB_REPO = "product-update-generator"
@@ -68,6 +70,21 @@ def save_default_to_github(github_path: str, new_bytes: bytes, commit_message: s
     except Exception as e:
         return False, f"깃허브 저장 중 오류: {e}"
 
+def load_vendor_config() -> dict:
+    """앱에 저장된 '판매처 삭제/추가' 기본 설정(판매처설정_기본.json)을 읽어옵니다.
+    파일이 없거나 읽기 실패하면 빈 설정(제외 없음, 추가 없음)을 반환합니다."""
+    default = {"excluded_vendors": [], "custom_vendors": []}
+    if not ASSET_VENDOR_CONFIG_PATH.exists():
+        return default
+    try:
+        data = json.loads(ASSET_VENDOR_CONFIG_PATH.read_text(encoding="utf-8"))
+        excluded = [v for v in (data.get("excluded_vendors") or []) if isinstance(v, str)]
+        custom = [c for c in (data.get("custom_vendors") or []) if isinstance(c, dict) and c.get("name")]
+        return {"excluded_vendors": excluded, "custom_vendors": custom}
+    except Exception:
+        return default
+
+
 st.title("신상품 업데이트 파일 생성기")
 st.caption(
     "기린.xlsx / S파일 두 개만 올리면, 지금까지 손으로 하시던 열 복사·파일 저장·카테고리 갱신·"
@@ -105,6 +122,90 @@ with st.sidebar:
     next_s_date = st.date_input("다음 라운드용 S파일 날짜", value=today + timedelta(days=1))
     category_row = st.number_input("카테고리번호.xlsx 갱신 행 번호", min_value=2, value=29, step=1)
     smartstore_col = st.text_input("스마트스토어(N파일) 카테고리 매핑 컬럼명", value="스마트오토")
+
+    st.header("4. 판매처 파일 관리 (삭제 / 추가)")
+
+    # 앱에 저장된 기본 설정은 세션당 한 번만 불러오고, 이후에는 사용자가 화면에서
+    # 직접 편집한 내용(세션 상태)을 그대로 유지합니다.
+    if "vendor_config_loaded" not in st.session_state:
+        _vc = load_vendor_config()
+        st.session_state["vendor_config_loaded"] = True
+        st.session_state["vendor_excluded_default"] = [
+            v for v in _vc["excluded_vendors"] if v in pl.ALL_OPTIONAL_VENDOR_NAMES
+        ]
+        st.session_state["custom_vendor_list"] = _vc["custom_vendors"]
+
+    with st.expander("삭제할 판매처 선택 (더 이상 생성하지 않을 파일)", expanded=False):
+        st.caption(
+            "예제생성 파일 중 곽충현/문정희, 판매처 파일 18개 중 X(날짜)파일을 제외한 "
+            "나머지 중에서 골라 생성을 건너뛸 수 있습니다. X파일은 스마트스토어(N파일) "
+            "변환에 내부적으로 쓰여 제외 목록에서 뺐습니다."
+        )
+        excluded_vendors = st.multiselect(
+            "생성하지 않을 파일",
+            options=pl.ALL_OPTIONAL_VENDOR_NAMES,
+            default=st.session_state["vendor_excluded_default"],
+            key="excluded_vendors_select",
+            help="여기서 선택한 판매처는 이번 실행부터 결과물(다운로드 목록/ZIP)에서 빠집니다.",
+        )
+
+    with st.expander("새 판매처 파일 추가", expanded=False):
+        st.caption(
+            "예제생성/판매처 파일과 같은 스타일(상품명 처리 방식)로 새 판매처 파일을 추가합니다. "
+            "카테고리 값을 입력하면 카테고리번호.xlsx에 그 이름의 컬럼을 만들고(이미 있으면 재사용) "
+            "모든 행에 같은 값을 채웁니다 — 코드별로 다른 값이 필요하면 나중에 카테고리번호.xlsx를 "
+            "직접 열어 행별로 수정하시면 됩니다."
+        )
+
+        if st.session_state["custom_vendor_list"]:
+            st.write("현재 추가된 판매처:")
+            for idx, cv in enumerate(st.session_state["custom_vendor_list"]):
+                style_label = pl.VENDOR_STYLE_INFO.get(
+                    cv.get("style", pl.DEFAULT_VENDOR_STYLE), {}
+                ).get("label", cv.get("style", ""))
+                col_a, col_b = st.columns([5, 1])
+                with col_a:
+                    val = cv.get("category_value") or "(카테고리 값 없음)"
+                    st.write(f"• **{cv.get('name')}** — {style_label} · 카테고리 값: {val}")
+                with col_b:
+                    if st.button("삭제", key=f"remove_custom_vendor_{idx}"):
+                        st.session_state["custom_vendor_list"].pop(idx)
+                        st.rerun()
+
+        st.markdown("**새 판매처 추가**")
+        new_vendor_name = st.text_input("판매처 이름 (파일명이 됩니다, 예: 신규거래처)", key="new_vendor_name")
+        new_vendor_style = st.selectbox(
+            "상품명 처리 스타일",
+            options=list(pl.VENDOR_STYLE_INFO.keys()),
+            format_func=lambda k: pl.VENDOR_STYLE_INFO[k]["label"],
+            key="new_vendor_style",
+        )
+        new_vendor_category_value = st.text_input(
+            "카테고리 값 (선택 — 비워두면 카테고리 매핑 없이 파일만 생성)",
+            key="new_vendor_category_value",
+        )
+
+        if st.button("+ 판매처 추가", key="add_custom_vendor_btn"):
+            name = new_vendor_name.strip()
+            existing_names = {c.get("name") for c in st.session_state["custom_vendor_list"]}
+            if not name:
+                st.warning("판매처 이름을 입력해주세요.")
+            elif name in pl.ALL_OPTIONAL_VENDOR_NAMES or name in existing_names:
+                st.warning(f"'{name}'은 이미 사용 중인 판매처 이름입니다. 다른 이름을 입력해주세요.")
+            else:
+                st.session_state["custom_vendor_list"].append({
+                    "name": name,
+                    "style": new_vendor_style,
+                    "category_value": new_vendor_category_value.strip(),
+                })
+                st.rerun()
+
+    save_vendor_config_default = st.checkbox(
+        "이 판매처 삭제/추가 설정을 앱의 새 기본값으로 영구 저장",
+        value=False,
+        help="체크하고 실행하면, 이번 실행뿐 아니라 앞으로 매번 다시 설정하지 않아도 "
+        "이 삭제/추가 목록이 기본값으로 쓰입니다.",
+    )
 
     run_clicked = st.button("전체 파이프라인 실행", type="primary", use_container_width=True)
 
@@ -173,6 +274,26 @@ if run_clicked:
         else:
             st.error(f"스마트스토어기본.xlsx 기본값 저장 실패: {err}")
 
+    custom_vendors = st.session_state.get("custom_vendor_list", [])
+
+    if save_vendor_config_default:
+        vendor_config_bytes = json.dumps(
+            {"excluded_vendors": excluded_vendors, "custom_vendors": custom_vendors},
+            ensure_ascii=False, indent=2,
+        ).encode("utf-8")
+        with st.spinner("판매처 삭제/추가 설정을 앱의 새 기본값으로 저장하는 중..."):
+            ok, err = save_default_to_github(
+                "판매처설정_기본.json", vendor_config_bytes,
+                "판매처설정_기본.json 갱신 (앱에서 설정)",
+            )
+        if ok:
+            st.success(
+                "판매처 삭제/추가 설정을 앱의 새 기본값으로 저장했습니다. "
+                "(재배포가 완료되기까지 1~2분 정도 걸릴 수 있습니다)"
+            )
+        else:
+            st.error(f"판매처 설정 저장 실패: {err}")
+
     with st.spinner("파이프라인 실행 중..."):
         try:
             result = pl.run_pipeline(
@@ -184,6 +305,8 @@ if run_clicked:
                 next_sfile_date=next_s_date.strftime("%Y%m%d"),
                 category_row=int(category_row),
                 smartstore_target_col=smartstore_col,
+                excluded_vendors=excluded_vendors,
+                custom_vendors=custom_vendors,
             )
         except Exception as e:
             st.exception(e)
