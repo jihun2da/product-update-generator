@@ -33,6 +33,15 @@ LOGIN_BTN_XPATH = 'xpath=//*[@id="frm_user"]/div/div[2]/button'
 UPLOAD_PATH = "/disp/admin/shop1/product/ProductExcelManage"
 UPLOAD_BTN_XPATH = 'xpath=//*[@id="dropZone"]/div/div[2]/button'
 
+# 실제 계정으로 진단 로그를 받아 확인한 결과, "엑셀 업로드" 버튼을 클릭하면 이 URL
+# 조각을 포함한 요청(POST .../exec/admin/product/ProductExcelSet)이 실제로 발생하는
+# 것이 확인됐습니다(2026-08-27, 클릭 버튼의 class="btnSubmit", data-get-id="dropZone",
+# 링크 텍스트 "엑셀 업로드"까지 애널리틱스 이벤트로 함께 확인). 즉 지금까지 고친
+# 클릭 자체는 정상적으로 서버에 전달되고 있습니다 — 남은 문제는 "이 요청의 응답을
+# 받기 전에 브라우저를 닫아버리는 것"입니다. 이 요청의 응답이 실제로 올 때까지
+# 직접 기다리기 위한 기준값으로 사용합니다.
+UPLOAD_SUBMIT_URL_HINT = "ProductExcelSet"
+
 # 업로드 결과 화면에서 "실패"로 볼 수 있는 문구 후보 (실제 계정으로 사용 테스트해서
 # 정상 동작하는 것을 확인했습니다 — 이후 문구가 다른 경우가 생기면 알려주시면 바로
 # 고치겠습니다)
@@ -61,6 +70,12 @@ class AccountResult:
     console_log: Optional[List[str]] = None
     button_html_before: Optional[str] = None
     button_html_after: Optional[str] = None
+    # 실제로 관찰된, "엑셀 업로드" 버튼이 호출하는 서버 요청(UPLOAD_SUBMIT_URL_HINT
+    # 포함)에 대한 구체적인 판정 결과입니다. submit_request_sent=True인데
+    # submit_response_status가 None이면 "요청은 보냈지만 응답을 못 받음"이라는
+    # 뜻으로, 지금까지 반복된 문제의 가장 유력한 원인입니다.
+    submit_request_sent: bool = False
+    submit_response_status: Optional[int] = None
 
 
 def ensure_chromium_installed(status_cb: Optional[Callable[[str], None]] = None):
@@ -160,9 +175,16 @@ def _visible_popup_text(page):
 
 def upload_one_account(playwright, name, cafe24_id, cafe24_pw, file_bytes, file_name,
                         headless=True, post_delay_sec=3, nav_timeout_ms=25000,
-                        debug_pause=False):
+                        debug_pause=False, submit_wait_sec=180):
     """단일 계정으로 로그인 -> 업로드 화면 이동 -> 파일 업로드 시도.
     실패해도 예외를 던지지 않고 AccountResult로 결과를 반환합니다(재시도하지 않음).
+
+    submit_wait_sec: 업로드 버튼 클릭 후, 실제 업로드 처리 요청(UPLOAD_SUBMIT_URL_HINT)의
+    응답이 올 때까지 최대 몇 초 기다릴지. 실제 계정으로 받은 진단 로그를 보면 클릭 자체는
+    정상적으로 이 요청을 서버로 보내지만, 상품 수가 많은 파일은 서버 처리가 오래 걸려
+    응답이 늦게 올 수 있습니다 — 이 시간 안에 응답이 오지 않으면 브라우저를 닫지 않고
+    끝까지 기다립니다(무한 대기는 아니며, 이 값을 넘기면 포기하고 진단 정보에 명확히
+    표시합니다).
 
     debug_pause=True이면(그리고 headless=False일 때만) 업로드 화면에 진입한 직후,
     자동 팝업 정리를 하기 전에 Playwright 인스펙터로 실행을 멈춥니다 — 화면에 남은
@@ -356,7 +378,14 @@ def upload_one_account(playwright, name, cafe24_id, cafe24_pw, file_bytes, file_
             pass
         except Exception:
             pass
-        time.sleep(1.5)
+        # 여기서도 순수 time.sleep() 대신 page.wait_for_timeout()을 씁니다 — 클릭
+        # 직전에 이 대기를 걸어두는 이유가 바로 "지금까지 밀린 네트워크 이벤트들이
+        # 확실히 다 처리되게" 하기 위함인데, page.on() 콜백은 Playwright API 호출을
+        # 통해서만 pump된다는 것을 확인했으므로(아래 submit_wait_sec 대기 로직 참고),
+        # 여기서 순수 time.sleep()을 쓰면 밀린 이벤트가 이 클릭 시점(click_state를
+        # "클릭 후"로 바꾸는 시점) 이후에야 뒤늦게 처리되면서, 사실은 클릭 "전"에 있었던
+        # 활동이 "클릭 후"로 잘못 분류될 위험이 있습니다.
+        page.wait_for_timeout(1500)
 
         screenshot_before_click = _safe_screenshot(page)
         try:
@@ -420,20 +449,43 @@ def upload_one_account(playwright, name, cafe24_id, cafe24_pw, file_bytes, file_
 
         # 업로드 버튼 클릭(및 확인창 승인) 직후, 실제 서버 처리가 끝나기 전에 브라우저를
         # 닫아버리면 파일이 화면에는 "진행중 100%"로 붙어 있는 것처럼 보여도 실제로는
-        # 아무것도 반영되지 않는 문제가 실사용 중 확인됐습니다 — 특히 상품 수가 많은
-        # 파일일수록 서버 처리 시간이 길어, 고정된 대기 시간(post_delay_sec)만으로는
-        # 부족할 수 있습니다. 고정 대기 전에 먼저 네트워크 활동이 잠잠해질 때까지
-        # (진행 중이던 업로드 요청이 실제로 끝날 때까지) 기다립니다 — 최대
-        # 60초까지 기다리고, 그래도 안 끝나면 예외를 삼키고 아래 고정 대기로 넘어갑니다
-        # (무한 대기는 방지).
-        try:
-            page.wait_for_load_state("networkidle", timeout=60000)
-        except PlaywrightTimeoutError:
-            pass
-        except Exception:
-            pass
+        # 아무것도 반영되지 않는 문제가 실사용 중 반복 확인됐습니다. 처음에는 일반적인
+        # "networkidle"(페이지의 모든 네트워크 활동이 잠잠해질 때까지)로 기다렸는데,
+        # 실제 진단 로그를 받아보니 이 방식의 근본적인 허점이 드러났습니다 — 카페24
+        # 관리자 화면은 알림/대시보드 등 계속 폴링하는 백그라운드 요청이 많아서
+        # "완전히 idle" 상태가 늦게 오거나, 반대로 우리가 정말 기다려야 하는 실제 업로드
+        # 요청(UPLOAD_SUBMIT_URL_HINT, 실제로 관찰: POST .../product/ProductExcelSet)의
+        # 응답이 아직 안 왔는데도 다른 조건으로 networkidle이 만족되어 너무 일찍 넘어갈
+        # 수 있었습니다. 이제는 애매한 "전체가 잠잠한지"가 아니라, 우리가 실제로 클릭한
+        # 그 요청의 응답이 왔는지를 직접 지켜봅니다 — 최대 submit_wait_sec(기본 180초)
+        # 까지 기다리고, 그동안은 절대 브라우저를 닫지 않습니다.
+        # 주의: 이 대기 루프는 반드시 page.wait_for_timeout()으로 쉬어야 합니다 —
+        # Playwright의 동기(sync) API는 등록해둔 이벤트 콜백(page.on("response") 등)을
+        # 메인 스레드가 Playwright API를 실제로 호출할 때 함께 처리(pump)하는 구조라서,
+        # 순수 파이썬 time.sleep()으로만 기다리면 그동안 도착한 응답 이벤트가 큐에 쌓인
+        # 채로 전달되지 않는 것이 로컬 테스트로 직접 확인됐습니다(실제로 서버는 1.5초 만에
+        # 응답했는데도, time.sleep()으로 기다리는 동안은 network_log에 전혀 기록되지 않다가
+        # 그 다음 Playwright API 호출(예: 화면 텍스트 읽기) 시점에야 한꺼번에 기록됨).
+        # page.wait_for_timeout()은 Playwright 자체 대기 함수라 이 문제가 없습니다.
+        submit_deadline = time.monotonic() + max(submit_wait_sec, 0)
+        submit_response_entry = None
+        while time.monotonic() < submit_deadline:
+            submit_response_entry = next(
+                (
+                    e for e in network_log
+                    if e["phase"] == "클릭 후" and e["kind"] == "응답"
+                    and UPLOAD_SUBMIT_URL_HINT in e.get("url", "")
+                ),
+                None,
+            )
+            if submit_response_entry is not None:
+                break
+            page.wait_for_timeout(1000)
 
-        time.sleep(post_delay_sec)
+        # 응답을 받았다면(또는 최대 시간을 다 기다렸다면) 화면이 최종 상태로 갱신될
+        # 여유만 짧게 더 둡니다 — 더 이상 이 시간이 "성공/실패를 좌우하는 핵심 대기"가
+        # 아니므로 길게 잡을 필요가 없습니다.
+        time.sleep(min(post_delay_sec, 5))
 
         body_text = ""
         try:
@@ -449,16 +501,18 @@ def upload_one_account(playwright, name, cafe24_id, cafe24_pw, file_bytes, file_
         combined_text = body_text + " " + " ".join(dialog_messages)
 
         # 추측이 아니라 실제로 관찰된 증거를 바탕으로 "버튼을 누른 게 진짜 뭔가를
-        # 했는지"를 판정합니다. 클릭 후 서버로 요청(xhr/fetch/document)이 하나도
-        # 없었다면, 클릭이 예외 없이 "성공"했더라도 실제로는 아무 동작도 하지 않은
-        # 것입니다 — 지금까지 반복된 "화면엔 100%인데 이력엔 안 남는" 증상의 가장
-        # 유력한 원인입니다. 요청은 있었는데 4xx/5xx 오류 응답이면 전혀 다른(서버
-        # 쪽) 문제이므로 그것도 구분해서 알려줍니다.
+        # 했는지", 더 나아가 "그 요청이 실제로 끝났는지"까지 판정합니다. 실제 계정으로
+        # 받은 진단 로그에서, 클릭 후 진짜 업로드 요청(UPLOAD_SUBMIT_URL_HINT)이 서버로
+        # 나가는 것까지는 확인됐지만 그 응답을 받은 기록이 없었습니다 — 이게 "요청 자체가
+        # 없음"과는 다른, 훨씬 더 구체적인 문제입니다. 아래 판정은 이 세 가지를 순서대로
+        # 구분합니다: (1) 진짜 업로드 요청 자체가 없었다(버튼이 아무 동작도 안 함),
+        # (2) 요청은 나갔는데 응답을 못 받았다(=지금까지 반복된 문제의 가장 유력한
+        # 원인 — 서버 처리가 오래 걸리거나 연결이 끊어짐), (3) 응답은 받았는데
+        # 오류였다(서버 쪽 문제), (4) 응답을 정상적으로 받았다(성공).
         post_click_requests = [e for e in network_log if e["phase"] == "클릭 후" and e["kind"] == "요청"]
-        post_click_error_responses = [
-            e for e in network_log
-            if e["phase"] == "클릭 후" and e["kind"] == "응답" and isinstance(e.get("status"), int) and e["status"] >= 400
-        ]
+        submit_request_entries = [e for e in post_click_requests if UPLOAD_SUBMIT_URL_HINT in e.get("url", "")]
+        submit_request_sent = bool(submit_request_entries)
+        submit_response_status = submit_response_entry["status"] if submit_response_entry else None
         button_changed = (
             button_html_before is not None
             and button_html_after is not None
@@ -472,19 +526,46 @@ def upload_one_account(playwright, name, cafe24_id, cafe24_pw, file_bytes, file_
                 "버튼을 다시 누른 경우 등). 아래 '클릭 전/후 버튼 HTML'과 '클릭 전/후 화면'을 "
                 "함께 확인해주세요."
             )
-        elif post_click_error_responses:
-            urls = ", ".join(sorted({e["url"] for e in post_click_error_responses}))
+        elif submit_request_sent and submit_response_entry is None:
             diagnosis = (
-                f"🟠 클릭 후 서버로 요청은 발생했지만 오류 응답을 받았습니다 ({urls}). "
-                "버튼 자체는 정상적으로 눌렸고, 서버 쪽(세션 만료, 파일 형식 등)을 "
-                "확인해봐야 하는 문제로 보입니다."
+                f"🔴 실제 업로드 처리 요청(서버로 \"{UPLOAD_SUBMIT_URL_HINT}\" 요청)은 정상적으로 "
+                f"전송됐지만, {submit_wait_sec}초를 기다려도 응답을 받지 못했습니다 — 지금까지 "
+                "반복된 문제의 가장 유력한 원인으로 보입니다. 상품 수가 아주 많아 서버 처리가 "
+                "이 시간보다 더 오래 걸리거나, 서버와의 연결이 중간에 끊어졌을 가능성이 있습니다. "
+                "'③'에서 대기 시간을 더 늘려서 다시 시도해보시거나, 그래도 안 되면 이 로그를 "
+                "그대로 알려주세요 — 대기 시간 문제가 아니라는 뜻이므로 다른 원인을 찾아야 합니다."
+            )
+        elif submit_response_status is not None and submit_response_status >= 400:
+            diagnosis = (
+                f"🟠 실제 업로드 처리 요청은 서버로 전달됐지만 오류 응답({submit_response_status})을 "
+                "받았습니다. 버튼 클릭과 대기 자체는 정상이며, 서버 쪽(세션 만료, 파일 형식/용량 "
+                "등)을 확인해봐야 하는 문제로 보입니다."
+            )
+        elif submit_response_status is not None:
+            diagnosis = (
+                f"🟢 실제 업로드 처리 요청이 서버로 전달됐고, 정상 응답({submit_response_status})까지 "
+                "받았습니다 — 버튼 클릭과 서버 처리가 끝까지 정상적으로 이어진 것으로 보입니다"
+                "(카페24 화면의 실제 반영 여부는 최종적으로 직접 확인해주세요)."
             )
         else:
-            diagnosis = (
-                "🟢 클릭 후 서버로 요청이 발생했고 오류 응답은 없었습니다 — 버튼 클릭은 "
-                "정상적으로 서버에 전달된 것으로 보입니다(카페24 화면의 실제 반영 여부는 "
-                "최종적으로 직접 확인해주세요)."
-            )
+            # UPLOAD_SUBMIT_URL_HINT와 일치하는 요청은 못 찾았지만(카페24 화면 구조가 달라졌을
+            # 수 있음), 클릭 후 다른 요청은 있었던 애매한 경우 — 오류 응답 유무로만 대략 판정.
+            post_click_error_responses = [
+                e for e in network_log
+                if e["phase"] == "클릭 후" and e["kind"] == "응답"
+                and isinstance(e.get("status"), int) and e["status"] >= 400
+            ]
+            if post_click_error_responses:
+                urls = ", ".join(sorted({e["url"] for e in post_click_error_responses}))
+                diagnosis = (
+                    f"🟠 클릭 후 서버로 요청은 발생했지만(업로드 요청인지는 특정 못함) 오류 응답을 "
+                    f"받았습니다 ({urls})."
+                )
+            else:
+                diagnosis = (
+                    "🟡 클릭 후 다른 요청은 있었지만, 실제 업로드 요청으로 보이는 요청을 특정하지 "
+                    "못했습니다 — 아래 네트워크 로그를 직접 확인해주세요."
+                )
         if button_changed:
             diagnosis += " (버튼의 HTML도 클릭 전후로 변화가 감지됐습니다.)"
 
@@ -495,18 +576,41 @@ def upload_one_account(playwright, name, cafe24_id, cafe24_pw, file_bytes, file_
                 screenshot_after_click=screenshot_after_click,
                 diagnosis=diagnosis, network_log=network_log, console_log=console_log,
                 button_html_before=button_html_before, button_html_after=button_html_after,
+                submit_request_sent=submit_request_sent, submit_response_status=submit_response_status,
             )
 
         dialog_note = f" (자동 승인한 확인창: {' / '.join(dialog_messages)})" if dialog_messages else ""
+
+        # 이전에는 이 지점까지 오면(=명시적인 실패 문구가 없으면) 무조건 "성공"으로
+        # 표시했는데, 이게 바로 반복 신고된 "실제로는 아무것도 안 됐는데 성공으로
+        # 잘못 나온다"는 문제의 핵심 원인이었습니다. 이제는 실제 업로드 처리 요청의
+        # 응답을 확인한 확실한 증거(🟢)가 있을 때만 "성공"으로 표시하고, 응답을 못
+        # 받았거나(🔴) 애매한 경우(🟠/🟡)는 "오류"로 정직하게 표시해서 진단 정보를
+        # 반드시 확인하도록 합니다.
+        if not diagnosis.startswith("🟢"):
+            return AccountResult(
+                name=name, status="error",
+                message="업로드 버튼은 눌렀지만, 서버 처리가 끝났다는 확실한 증거를 확인하지 "
+                "못했습니다 — 아래 '진단 정보'를 꼭 확인해주세요." + dialog_note,
+                screenshot=shot,
+                screenshot_before_click=screenshot_before_click,
+                screenshot_after_click=screenshot_after_click,
+                diagnosis=diagnosis, network_log=network_log, console_log=console_log,
+                button_html_before=button_html_before, button_html_after=button_html_after,
+                submit_request_sent=submit_request_sent, submit_response_status=submit_response_status,
+            )
+
         return AccountResult(
             name=name, status="success",
-            message="업로드 시도 완료 (자동 판별 결과이므로, 스크린샷으로 실제 반영 여부를 확인해주세요)"
+            message="업로드 시도 완료 (실제 업로드 처리 요청의 정상 응답까지 확인했습니다 — 그래도 "
+            "카페24 화면에서 실제 반영 여부를 최종 확인해주세요)"
             + dialog_note,
             screenshot=shot,
             screenshot_before_click=screenshot_before_click,
             screenshot_after_click=screenshot_after_click,
             diagnosis=diagnosis, network_log=network_log, console_log=console_log,
             button_html_before=button_html_before, button_html_after=button_html_after,
+            submit_request_sent=submit_request_sent, submit_response_status=submit_response_status,
         )
 
     except Exception as e:
@@ -554,12 +658,14 @@ def _ensure_windows_subprocess_event_loop():
 
 
 def run_batch_upload(accounts, headless=True, post_delay_sec=3, progress_cb=None,
-                      debug_pause=False) -> List[AccountResult]:
+                      debug_pause=False, submit_wait_sec=180) -> List[AccountResult]:
     """
     accounts: [{'name':.., 'id':.., 'password':.., 'file_bytes':.., 'file_name':..}, ...]
     progress_cb: 선택. callable(index, total, AccountResult) — 진행 상황 콜백(Streamlit 갱신용)
     debug_pause: 선택. True면 각 계정의 업로드 화면 진입 직후 자동 진행을 멈춥니다
         (headless=False일 때만 의미가 있습니다 — upload_one_account 참고).
+    submit_wait_sec: 선택. 업로드 버튼 클릭 후 실제 업로드 처리 응답을 최대 몇 초까지
+        기다릴지 (upload_one_account 참고).
     반환: AccountResult 리스트 (accounts와 같은 순서)
     """
     _ensure_windows_subprocess_event_loop()
@@ -571,7 +677,7 @@ def run_batch_upload(accounts, headless=True, post_delay_sec=3, progress_cb=None
                 p, acc["name"], acc["id"], acc["password"],
                 acc["file_bytes"], acc["file_name"],
                 headless=headless, post_delay_sec=post_delay_sec,
-                debug_pause=debug_pause,
+                debug_pause=debug_pause, submit_wait_sec=submit_wait_sec,
             )
             results.append(result)
             if progress_cb:
