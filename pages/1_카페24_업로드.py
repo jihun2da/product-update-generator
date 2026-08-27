@@ -442,16 +442,47 @@ if results:
     else:
         st.success("모든 계정이 성공으로 판별됐습니다. (자동 판별이므로 스크린샷으로 실제 반영 여부를 꼭 확인해주세요)")
 
-    with st.expander("계정별 스크린샷 보기", expanded=False):
+    with st.expander("계정별 스크린샷 보기 (클릭 전 / 클릭 직후 / 최종 3장 비교)", expanded=False):
+        st.caption(
+            "💡 업로드 버튼을 눌렀는데도 실제 반영이 안 되는 문제를 진단하기 위해, "
+            "버튼을 누르기 직전 / 누른 직후 / 대기 후 최종 화면 3장을 함께 보여줍니다. "
+            "'클릭 직전'과 '클릭 직후' 화면이 서로 똑같아 보인다면(아무 변화가 없다면), "
+            "버튼 클릭이 실제로는 아무 동작도 하지 않았을 가능성이 있다는 뜻이니 이 3장을 "
+            "함께 캡처해서 알려주시면 추가로 진단하는 데 큰 도움이 됩니다."
+        )
         for r in results:
             st.write(f"**{r.name}** — {status_label.get(r.status, r.status)}")
-            if r.screenshot:
-                st.image(r.screenshot, use_container_width=True)
-            else:
-                st.caption("스크린샷 없음")
+            cols = st.columns(3)
+            with cols[0]:
+                st.caption("① 클릭 직전")
+                shot_before = getattr(r, "screenshot_before_click", None)
+                if shot_before:
+                    st.image(shot_before, use_container_width=True)
+                else:
+                    st.caption("없음")
+            with cols[1]:
+                st.caption("② 클릭 직후")
+                shot_after = getattr(r, "screenshot_after_click", None)
+                if shot_after:
+                    st.image(shot_after, use_container_width=True)
+                else:
+                    st.caption("없음")
+            with cols[2]:
+                st.caption("③ 최종(대기 후)")
+                if r.screenshot:
+                    st.image(r.screenshot, use_container_width=True)
+                else:
+                    st.caption("없음")
             st.divider()
 
-    shots = [(r.name, r.screenshot) for r in results if r.screenshot]
+    shots = []
+    for r in results:
+        if getattr(r, "screenshot_before_click", None):
+            shots.append((f"{r.name}_1_클릭직전", r.screenshot_before_click))
+        if getattr(r, "screenshot_after_click", None):
+            shots.append((f"{r.name}_2_클릭직후", r.screenshot_after_click))
+        if r.screenshot:
+            shots.append((f"{r.name}_3_최종", r.screenshot))
     if shots:
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
