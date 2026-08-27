@@ -30,7 +30,7 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 # 상황이 반복돼서(로컬 파일을 바꾸고 앱을 재시작해도, 실제로 뭐가 바뀌었는지 화면에서
 # 바로 확인할 방법이 없었습니다) 추가한 버전 표시입니다. 수정할 때마다 이 값을
 # 갱신하고, "카페24 업로드" 페이지 화면 아래쪽에 그대로 표시합니다.
-MODULE_VERSION = "2026-08-27-4 (업로드 확인창이 진짜 팝업 페이지로 뜨는 경우까지 처리 + 진단 강화)"
+MODULE_VERSION = "2026-08-27-5 (진짜 원인 발견: 첨부 파일을 너무 일찍 삭제하던 버그 수정)"
 
 LOGIN_URL = "https://eclogin.cafe24.com/Shop/"
 ID_XPATH = 'xpath=//*[@id="mall_id"]'
@@ -315,6 +315,7 @@ def upload_one_account(playwright, name, cafe24_id, cafe24_pw, file_bytes, file_
     network_log = []
     console_log = []
     popup_page_log = []
+    temp_path = None
     try:
         browser = playwright.chromium.launch(headless=headless, args=["--no-sandbox"])
         context = browser.new_context(accept_downloads=False)
@@ -575,10 +576,25 @@ def upload_one_account(playwright, name, cafe24_id, cafe24_pw, file_bytes, file_
             except Exception:
                 attached = False
 
-        try:
-            os.remove(temp_path)
-        except Exception:
-            pass
+        # ⚠️⚠️⚠️ (2026-08-27, 진짜 근본 원인 발견) 실제 계정으로 받은 진단 로그를 보면,
+        # 확인창은 정확히 자동 승인됐고("[cafe24-uploader:auto-confirm] 해당 파일을
+        # 업로드 하시겠습니까?" 콘솔 로그로 확인) 실제 업로드 요청(ProductExcelSet)도
+        # 정상적으로 시작됐지만, 그 요청이 "net::ERR_FILE_NOT_FOUND"로 즉시 실패했습니다.
+        # 이 오류는 브라우저가 <input type=file>에 첨부된 파일을 실제로 서버에 보내는
+        # 시점(=업로드 버튼을 눌러 폼이 실제로 제출되는 시점)에 그 파일을 디스크에서
+        # 다시 읽으려다가 파일이 이미 사라진 경우에만 발생합니다. set_input_files()는
+        # 파일을 그 자리에서 읽어서 메모리에 담아두는 게 아니라 "이 경로의 파일을
+        # 나중에 제출 시점에 읽어라"는 참조만 저장해두는 방식이기 때문에, 여기서
+        # 파일을 첨부한 직후 바로 삭제해버리면(바로 아래 있었던 os.remove(temp_path)),
+        # 몇 초 뒤 실제로 업로드 버튼을 눌러 폼이 제출될 때는 이미 파일이 없어서
+        # 이 오류가 나는 것이었습니다. 사용자가 예전에 로컬 매크로(Selenium+pywinmacro)
+        # 로 쓰던 코드를 비교해보니, 그 코드는 업로드가 끝날 때까지 파일을 디스크에서
+        # 지우지 않았습니다 — 바로 이 차이가 지금까지 반복된 "확인창은 넘어가는데
+        # 업로드가 안 된다"는 문제의 진짜 원인이었습니다(그동안 확인창 관련 수정을
+        # 여러 차례 했지만, 확인창 자체는 이미 정상적으로 처리되고 있었고 진짜 문제는
+        # 이 파일 삭제 타이밍이었습니다). 이제는 이 계정의 업로드 시도가 완전히
+        # 끝날 때까지(=브라우저를 닫을 때까지) 파일을 지우지 않고, 맨 아래 finally
+        # 블록에서 한 번만 정리합니다.
 
         if not attached:
             shot = _safe_screenshot(page)
@@ -881,6 +897,14 @@ def upload_one_account(playwright, name, cafe24_id, cafe24_pw, file_bytes, file_
                 browser.close()
         except Exception:
             pass
+        # 첨부한 파일은 브라우저가 완전히 닫힐 때까지(=실제 업로드 요청이 파일을
+        # 다 읽어갈 기회가 지난 뒤) 여기서 한 번만 정리합니다 — 위 net::ERR_FILE_NOT_FOUND
+        # 원인 설명 참고.
+        if temp_path:
+            try:
+                os.remove(temp_path)
+            except Exception:
+                pass
 
 
 def _safe_screenshot(page):
