@@ -51,6 +51,16 @@ class AccountResult:
     # 있게 합니다. 실패 원인 진단용이며, 못 찍었을 때는 None입니다.
     screenshot_before_click: Optional[bytes] = None
     screenshot_after_click: Optional[bytes] = None
+    # "버튼을 눌렀을 때 실제로 무슨 일이 일어났는지"를 추측이 아니라 직접 관찰한
+    # 증거로 확인하기 위한 진단 정보입니다. 계속 같은 문제가 재현될 때, 이 정보를
+    # 보면 (1) 클릭 후 서버로 요청이 실제로 발생했는지 (2) 발생했다면 성공/실패
+    # 응답이었는지 (3) 버튼의 HTML(문구/활성화 상태)이 클릭 전후로 바뀌었는지 (4)
+    # 페이지에 자바스크립트 오류가 있었는지를 바로 알 수 있습니다.
+    diagnosis: str = ""
+    network_log: Optional[List[dict]] = None
+    console_log: Optional[List[str]] = None
+    button_html_before: Optional[str] = None
+    button_html_after: Optional[str] = None
 
 
 def ensure_chromium_installed(status_cb: Optional[Callable[[str], None]] = None):
@@ -162,6 +172,11 @@ def upload_one_account(playwright, name, cafe24_id, cafe24_pw, file_bytes, file_
     page = None
     screenshot_before_click = None
     screenshot_after_click = None
+    button_html_before = None
+    button_html_after = None
+    diagnosis = ""
+    network_log = []
+    console_log = []
     try:
         browser = playwright.chromium.launch(headless=headless, args=["--no-sandbox"])
         context = browser.new_context(accept_downloads=False)
@@ -188,6 +203,50 @@ def upload_one_account(playwright, name, cafe24_id, cafe24_pw, file_bytes, file_
 
         page.on("dialog", _handle_dialog)
 
+        # "업로드 버튼을 눌렀는데 실제로 반영이 안 된다"는 문제가 대기 시간을 늘려도
+        # 계속 재현돼서, 더 이상 추측으로 고치지 않고 실제로 무슨 일이 일어나는지
+        # 직접 관찰하기 위한 계측입니다. 콘솔 메시지(자바스크립트 오류 포함)와
+        # 네트워크 요청/응답을 기록해두고, 버튼 클릭 "전"과 "후"를 구분해서 남깁니다
+        # — 클릭 후에 서버로 요청이 아예 안 갔다면 클릭이 실제로는 아무 동작도
+        # 안 했다는 뜻이고, 요청은 갔는데 오류 응답이면 서버 쪽 문제라는 뜻이므로
+        # 완전히 다른 해결책이 필요합니다. 이 정보는 화면 "④ 업로드 결과"의
+        # "진단 정보"에서 그대로 확인할 수 있습니다.
+        click_state = {"clicked": False}
+
+        def _handle_console(msg):
+            try:
+                console_log.append(f"[{msg.type}] {msg.text}")
+            except Exception:
+                pass
+
+        def _handle_request(request):
+            try:
+                if request.resource_type in ("xhr", "fetch", "document"):
+                    network_log.append({
+                        "phase": "클릭 후" if click_state["clicked"] else "클릭 전",
+                        "kind": "요청",
+                        "method": request.method,
+                        "url": request.url,
+                    })
+            except Exception:
+                pass
+
+        def _handle_response(response):
+            try:
+                if response.request.resource_type in ("xhr", "fetch", "document"):
+                    network_log.append({
+                        "phase": "클릭 후" if click_state["clicked"] else "클릭 전",
+                        "kind": "응답",
+                        "status": response.status,
+                        "url": response.url,
+                    })
+            except Exception:
+                pass
+
+        page.on("console", _handle_console)
+        page.on("request", _handle_request)
+        page.on("response", _handle_response)
+
         page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=nav_timeout_ms)
         page.locator(ID_XPATH).fill(cafe24_id)
         page.locator(PW_XPATH).fill(cafe24_pw)
@@ -206,7 +265,10 @@ def upload_one_account(playwright, name, cafe24_id, cafe24_pw, file_bytes, file_
                 pass
             shot = _safe_screenshot(page)
             reason = LOGIN_FAIL_TEXT if LOGIN_FAIL_TEXT in body_text else "로그인 후에도 로그인 페이지에 머물러 있습니다."
-            return AccountResult(name=name, status="login_fail", message=reason, screenshot=shot)
+            return AccountResult(
+                name=name, status="login_fail", message=reason, screenshot=shot,
+                network_log=network_log, console_log=console_log,
+            )
 
         _close_popups(context, page)
 
@@ -275,6 +337,7 @@ def upload_one_account(playwright, name, cafe24_id, cafe24_pw, file_bytes, file_
                 name=name, status="error",
                 message="업로드 파일 입력창을 찾지 못했습니다 (페이지 구조가 예상과 다를 수 있습니다).",
                 screenshot=shot,
+                network_log=network_log, console_log=console_log,
             )
 
         # 파일을 방금 첨부한 직후에는, 화면이 파일을 검증/미리보기 처리하는 중이라
@@ -296,6 +359,12 @@ def upload_one_account(playwright, name, cafe24_id, cafe24_pw, file_bytes, file_
         time.sleep(1.5)
 
         screenshot_before_click = _safe_screenshot(page)
+        try:
+            button_html_before = page.locator(UPLOAD_BTN_XPATH).first.evaluate(
+                "el => el.outerHTML"
+            )
+        except Exception:
+            button_html_before = None
 
         # 파일 첨부 후 새로 뜬 팝업이 업로드 버튼을 가릴 수 있어 한 번 더 정리한 뒤
         # 클릭합니다. 클릭 자체가 끝까지 실패하면(예: 팝업에 가려져 클릭이 막히는 경우)
@@ -303,9 +372,18 @@ def upload_one_account(playwright, name, cafe24_id, cafe24_pw, file_bytes, file_
         # 눌리지 않았는데도 "성공"으로 잘못 표시되는 문제가 실사용 중 확인됐습니다.
         # 대신 팝업 정리 후 한 번 더 재시도하고, 그래도 안 되면 오류로 명확히 보고합니다
         # (재시도는 이 클릭 단계 안에서만이며, 계정 자체를 다시 시도하지는 않습니다).
+        #
+        # click_state["clicked"]는 click() 호출 "직전"에 True로 바꿉니다 — click() 호출이
+        # 반환되는 시점과, 클릭으로 촉발된 페이지 내부 로직(예: confirm() 대화상자를 거쳐
+        # 실제 fetch가 나가는 것)이 Python 쪽에 통지되는 시점 사이에는 실제로 순서가
+        # 보장되지 않는다는 것이 로컬 테스트로 확인됐습니다 — click() 호출 "이후"에
+        # 플래그를 세팅했더니, 클릭이 유발한 실제 요청이 백그라운드에서 먼저 처리되면서
+        # "클릭 전"으로 잘못 분류되는 레이스 컨디션이 있었습니다. 클릭을 시도하는 순간
+        # 자체를 기준점으로 삼아야 이 레이스가 없습니다.
         click_error = None
         for attempt in range(2):
             try:
+                click_state["clicked"] = True
                 page.locator(UPLOAD_BTN_XPATH).click(timeout=5000)
                 click_error = None
                 break
@@ -326,8 +404,18 @@ def upload_one_account(playwright, name, cafe24_id, cafe24_pw, file_bytes, file_
             return AccountResult(
                 name=name, status="error", message=msg, screenshot=shot,
                 screenshot_before_click=screenshot_before_click,
+                button_html_before=button_html_before,
+                network_log=network_log, console_log=console_log,
             )
 
+        # 클릭 직후 버튼 자체의 HTML(문구/활성화 상태 등)도 함께 남겨서, 클릭 전과
+        # 비교했을 때 실제로 뭔가 바뀌었는지 확인할 수 있게 합니다.
+        try:
+            button_html_after = page.locator(UPLOAD_BTN_XPATH).first.evaluate(
+                "el => el.outerHTML"
+            )
+        except Exception:
+            button_html_after = None
         screenshot_after_click = _safe_screenshot(page)
 
         # 업로드 버튼 클릭(및 확인창 승인) 직후, 실제 서버 처리가 끝나기 전에 브라우저를
@@ -360,11 +448,53 @@ def upload_one_account(playwright, name, cafe24_id, cafe24_pw, file_bytes, file_
         # 본문(body_text)만 봐서는 놓칠 수 있기 때문입니다.
         combined_text = body_text + " " + " ".join(dialog_messages)
 
+        # 추측이 아니라 실제로 관찰된 증거를 바탕으로 "버튼을 누른 게 진짜 뭔가를
+        # 했는지"를 판정합니다. 클릭 후 서버로 요청(xhr/fetch/document)이 하나도
+        # 없었다면, 클릭이 예외 없이 "성공"했더라도 실제로는 아무 동작도 하지 않은
+        # 것입니다 — 지금까지 반복된 "화면엔 100%인데 이력엔 안 남는" 증상의 가장
+        # 유력한 원인입니다. 요청은 있었는데 4xx/5xx 오류 응답이면 전혀 다른(서버
+        # 쪽) 문제이므로 그것도 구분해서 알려줍니다.
+        post_click_requests = [e for e in network_log if e["phase"] == "클릭 후" and e["kind"] == "요청"]
+        post_click_error_responses = [
+            e for e in network_log
+            if e["phase"] == "클릭 후" and e["kind"] == "응답" and isinstance(e.get("status"), int) and e["status"] >= 400
+        ]
+        button_changed = (
+            button_html_before is not None
+            and button_html_after is not None
+            and button_html_before != button_html_after
+        )
+
+        if not post_click_requests:
+            diagnosis = (
+                "🔴 클릭 후 서버로 어떤 요청도 발생하지 않았습니다 — 버튼 클릭이 실제로는 "
+                "아무 동작도 하지 않았을 가능성이 매우 높습니다(예: 이미 다른 상태로 바뀐 "
+                "버튼을 다시 누른 경우 등). 아래 '클릭 전/후 버튼 HTML'과 '클릭 전/후 화면'을 "
+                "함께 확인해주세요."
+            )
+        elif post_click_error_responses:
+            urls = ", ".join(sorted({e["url"] for e in post_click_error_responses}))
+            diagnosis = (
+                f"🟠 클릭 후 서버로 요청은 발생했지만 오류 응답을 받았습니다 ({urls}). "
+                "버튼 자체는 정상적으로 눌렸고, 서버 쪽(세션 만료, 파일 형식 등)을 "
+                "확인해봐야 하는 문제로 보입니다."
+            )
+        else:
+            diagnosis = (
+                "🟢 클릭 후 서버로 요청이 발생했고 오류 응답은 없었습니다 — 버튼 클릭은 "
+                "정상적으로 서버에 전달된 것으로 보입니다(카페24 화면의 실제 반영 여부는 "
+                "최종적으로 직접 확인해주세요)."
+            )
+        if button_changed:
+            diagnosis += " (버튼의 HTML도 클릭 전후로 변화가 감지됐습니다.)"
+
         if any(kw in combined_text for kw in FAIL_KEYWORDS):
             return AccountResult(
                 name=name, status="fail", message="업로드 실패 문구가 감지됐습니다.", screenshot=shot,
                 screenshot_before_click=screenshot_before_click,
                 screenshot_after_click=screenshot_after_click,
+                diagnosis=diagnosis, network_log=network_log, console_log=console_log,
+                button_html_before=button_html_before, button_html_after=button_html_after,
             )
 
         dialog_note = f" (자동 승인한 확인창: {' / '.join(dialog_messages)})" if dialog_messages else ""
@@ -375,6 +505,8 @@ def upload_one_account(playwright, name, cafe24_id, cafe24_pw, file_bytes, file_
             screenshot=shot,
             screenshot_before_click=screenshot_before_click,
             screenshot_after_click=screenshot_after_click,
+            diagnosis=diagnosis, network_log=network_log, console_log=console_log,
+            button_html_before=button_html_before, button_html_after=button_html_after,
         )
 
     except Exception as e:
@@ -383,6 +515,9 @@ def upload_one_account(playwright, name, cafe24_id, cafe24_pw, file_bytes, file_
             name=name, status="error", message=str(e), screenshot=shot,
             screenshot_before_click=screenshot_before_click,
             screenshot_after_click=screenshot_after_click,
+            diagnosis=diagnosis,
+            network_log=network_log, console_log=console_log,
+            button_html_before=button_html_before, button_html_after=button_html_after,
         )
     finally:
         try:
