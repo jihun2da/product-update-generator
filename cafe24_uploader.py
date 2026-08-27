@@ -159,6 +159,27 @@ def upload_one_account(playwright, name, cafe24_id, cafe24_pw, file_bytes, file_
         context = browser.new_context(accept_downloads=False)
         page = context.new_page()
 
+        # 카페24는 업로드 버튼을 누르면 브라우저 네이티브 확인창(예: "해당 파일을
+        # 업로드 하시겠습니까?")을 띄웁니다. Playwright는 이런 다이얼로그를 처리하는
+        # 핸들러가 없으면 기본적으로 자동 "취소" 처리를 해버려서, 실제로는 업로드가
+        # 진행되지 않았는데도 그대로 넘어가 버리는 문제가 있었습니다(실사용 테스트 중
+        # 확인 — 팝업은 잘 닫혔지만 그 다음 뜨는 이 확인창 때문에 업로드가 취소되고
+        # 있었습니다). 페이지 생성 직후부터 등록해두어, 어떤 시점에 다이얼로그가 뜨든
+        # 항상 "확인"을 누른 것과 동일하게 자동으로 승인(accept)합니다.
+        dialog_messages = []
+
+        def _handle_dialog(dialog):
+            try:
+                dialog_messages.append(dialog.message)
+            except Exception:
+                pass
+            try:
+                dialog.accept()
+            except Exception:
+                pass
+
+        page.on("dialog", _handle_dialog)
+
         page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=nav_timeout_ms)
         page.locator(ID_XPATH).fill(cafe24_id)
         page.locator(PW_XPATH).fill(cafe24_pw)
@@ -276,12 +297,19 @@ def upload_one_account(playwright, name, cafe24_id, cafe24_pw, file_bytes, file_
 
         shot = _safe_screenshot(page)
 
-        if any(kw in body_text for kw in FAIL_KEYWORDS):
+        # 네이티브 확인창(예: "해당 파일을 업로드 하시겠습니까?")에 뜬 문구도 실패 판별
+        # 대상에 함께 포함합니다 — 카페24가 오류를 이런 확인창으로 띄우는 경우 페이지
+        # 본문(body_text)만 봐서는 놓칠 수 있기 때문입니다.
+        combined_text = body_text + " " + " ".join(dialog_messages)
+
+        if any(kw in combined_text for kw in FAIL_KEYWORDS):
             return AccountResult(name=name, status="fail", message="업로드 실패 문구가 감지됐습니다.", screenshot=shot)
 
+        dialog_note = f" (자동 승인한 확인창: {' / '.join(dialog_messages)})" if dialog_messages else ""
         return AccountResult(
             name=name, status="success",
-            message="업로드 시도 완료 (자동 판별 결과이므로, 스크린샷으로 실제 반영 여부를 확인해주세요)",
+            message="업로드 시도 완료 (자동 판별 결과이므로, 스크린샷으로 실제 반영 여부를 확인해주세요)"
+            + dialog_note,
             screenshot=shot,
         )
 
