@@ -1,4 +1,8 @@
 {
-  "excluded_vendors": [],
+  "excluded_vendors": [
+    "현건주",
+    "백종열",
+    "이지민"
+  ],
   "custom_vendors": []
 }
