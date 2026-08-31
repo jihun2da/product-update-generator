@@ -155,21 +155,49 @@ def _style_name_5ban(name):
 # 'label'은 화면에 보여줄 설명입니다. 기존 판매처들의 가격 재계산(김하늘)이나 적립금 삭제
 # (서송이), 진열상태 변경(모나마켓) 같은 개별 특수 규칙은 판매처마다 달라 일반화하지 않고,
 # 상품명 처리 스타일(2/3/5번시트)만 선택하도록 했습니다.
+#
+# 'base'는 이 스타일이 어느 시점의 데이터를 기반으로 파일을 만드는지 나타냅니다.
+# - 'dudu': 2단계 두두사사(옵션ver3 결과, 사이즈/색상별로 이미 나뉜 상태) 데이터 기반.
+#   2/3/5번시트(김하늘/박미리/오토 등)와 동일한 기존 방식 — 결과는 stage2(판매처 파일)에 들어갑니다.
+# - 'pre_expansion': 0단계(사이즈/색상으로 나뉘기 전, 문정희/곽충현과 동일한 시점) 데이터 기반.
+#   결과는 stage1(예제생성 파일)에 들어가고, 카테고리 매핑도 문정희/곽충현과 같은 방식
+#   (apply_category_mapping_to_self, 파일 자신의 상품분류 번호 값을 그대로 매핑 키로 사용)으로 처리됩니다.
 VENDOR_STYLE_INFO = {
     '2번시트': {
-        'label': '2번시트 스타일 — 상품명 그대로 복사 (김하늘/서송이/이지민 등과 동일)',
+        'label': '2번시트 스타일 — 상품명 그대로 복사, 사이즈별로 나뉜 판매처 파일 (김하늘/서송이/이지민 등과 동일)',
         'sheet': '2번시트',
         'name_fn': _style_name_2ban,
+        'base': 'dudu',
     },
     '3번시트': {
-        'label': "3번시트 스타일 — 상품명에서 'KC' 앞부분 삭제 + '<' 이후 삭제 + 공백 제거 (박미리와 동일)",
+        'label': "3번시트 스타일 — 상품명에서 'KC' 앞부분 삭제 + '<' 이후 삭제 + 공백 제거, 사이즈별로 나뉜 판매처 파일 (박미리와 동일)",
         'sheet': '3번시트',
         'name_fn': _style_name_3ban,
+        'base': 'dudu',
     },
     '5번시트': {
-        'label': "5번시트 스타일 — 상품명에서 '<' 이후 삭제 + 'KC' 제거 (오토/오마베 등과 동일)",
+        'label': "5번시트 스타일 — 상품명에서 '<' 이후 삭제 + 'KC' 제거, 사이즈별로 나뉜 판매처 파일 (오토/오마베 등과 동일)",
         'sheet': '5번시트',
         'name_fn': _style_name_5ban,
+        'base': 'dudu',
+    },
+    '2번시트(사이즈분류전)': {
+        'label': (
+            '2번시트 스타일 (사이즈 분류 전) — 상품명 그대로, 문정희 파일처럼 사이즈/색상으로 '
+            '나뉘기 전 상태로 예제생성 단계에서 생성'
+        ),
+        'sheet': '2번시트',
+        'name_fn': _style_name_2ban,
+        'base': 'pre_expansion',
+    },
+    '5번시트(사이즈분류전)': {
+        'label': (
+            "5번시트 스타일 (사이즈 분류 전) — 상품명에서 '<' 이후 삭제 + 'KC' 제거, 문정희 파일처럼 "
+            "사이즈/색상으로 나뉘기 전 상태로 예제생성 단계에서 생성"
+        ),
+        'sheet': '5번시트',
+        'name_fn': _style_name_5ban,
+        'base': 'pre_expansion',
     },
 }
 
@@ -178,10 +206,14 @@ DEFAULT_VENDOR_STYLE = '2번시트'
 
 def add_vendor_category_column(category_bytes, vendor_name, value):
     """카테고리번호.xlsx에 vendor_name과 같은 이름의 헤더(1행) 컬럼이 있으면 재사용하고,
-    없으면 새로 추가합니다. '원본'(A열) 값이 있는 모든 데이터 행에 value를 동일하게
-    채워 넣습니다(판매처마다 원본 코드별로 다른 값을 매핑하는 기존 방식과 달리,
-    신규 판매처는 우선 모든 코드에 같은 값 하나로 시작합니다 — 이후 코드별로 세분화가
-    필요하면 카테고리번호.xlsx를 직접 열어 행별로 값을 다르게 수정하면 됩니다).
+    없으면 새로 추가합니다. '원본'(A열) 값이 있는 모든 데이터 행에 value를 똑같이
+    채워 넣습니다.
+
+    주의: 카테고리번호.xlsx의 기존 판매처 컬럼들은 원본 코드마다(행마다) 서로 다른 값이
+    들어있습니다(상품 종류별로 분류가 다르기 때문). 이 함수는 모든 행에 '같은 값 하나'를
+    채우는 단순한 방식이라, 상품 종류가 여러 가지인 경우 실제 매핑과 다를 수 있습니다.
+    대부분의 경우 이미 설정되어 있는 비슷한 판매처의 값을 그대로 복사해서 쓰는
+    copy_vendor_category_column()을 사용하는 편이 더 정확합니다.
 
     반환: (new_bytes, 실제 사용된 컬럼 이름, 새로 만든 컬럼인지 여부)
     """
@@ -207,8 +239,51 @@ def add_vendor_category_column(category_bytes, vendor_name, value):
     return wb_bytes(wb), vendor_name, is_new
 
 
+def copy_vendor_category_column(category_bytes, vendor_name, source_vendor_name):
+    """카테고리번호.xlsx에서 이미 설정되어 있는 source_vendor_name 컬럼의 행별 값을
+    그대로 vendor_name 컬럼(없으면 새로 생성)에 복사합니다.
+
+    카테고리번호.xlsx는 판매처마다 원본 코드(행)별로 값이 다르므로, 신규 판매처를
+    이미 있는 비슷한 판매처와 '완전히 동일한 카테고리 분류'로 시작하고 싶을 때
+    (가장 흔한 경우) 이 함수를 씁니다. 이후 코드별로 값을 다르게 세분화하고 싶으면
+    카테고리번호.xlsx를 직접 열어 새로 생긴 vendor_name 컬럼을 행별로 수정하면 됩니다.
+
+    반환: (new_bytes, 실제 사용된 컬럼 이름, 새로 만든 컬럼인지 여부, 오류 메시지(문제 없으면 None))
+    """
+    wb = load_wb(category_bytes, data_only=False)
+    ws = wb.active
+
+    header_col = None
+    source_col = None
+    for c in range(1, ws.max_column + 1):
+        header_val = safe_str(ws.cell(row=1, column=c).value).strip()
+        if header_val == vendor_name:
+            header_col = c
+        if header_val == source_vendor_name:
+            source_col = c
+
+    if source_col is None:
+        return category_bytes, vendor_name, False, (
+            f"'{source_vendor_name}' 컬럼을 카테고리번호.xlsx에서 찾을 수 없어 복사하지 못했습니다."
+        )
+
+    is_new = header_col is None
+    if header_col is None:
+        header_col = ws.max_column + 1
+        ws.cell(row=1, column=header_col).value = vendor_name
+
+    for r in range(2, ws.max_row + 1):
+        if ws.cell(row=r, column=1).value in (None, ''):
+            continue
+        ws.cell(row=r, column=header_col).value = ws.cell(row=r, column=source_col).value
+
+    return wb_bytes(wb), vendor_name, is_new, None
+
+
 def add_custom_vendor_files(outputs, df_dudu, custom_vendors, column_name='상품명'):
-    """custom_vendors: [{'name': str, 'style': '2번시트'|'3번시트'|'5번시트'}, ...]
+    """custom_vendors 중 base가 'dudu'인 스타일(2/3/5번시트, 기존 방식)만 처리합니다.
+    base가 'pre_expansion'인 항목은 add_custom_vendor_stage1_files()가 별도로 처리하므로
+    여기서는 건너뜁니다.
 
     두두사사 데이터를 선택한 스타일로 상품명만 정리해서 새 판매처 파일을 추가로
     생성합니다(가격 재계산 등 개별 특수 규칙은 적용하지 않는, 순수 스타일 복사본).
@@ -220,16 +295,68 @@ def add_custom_vendor_files(outputs, df_dudu, custom_vendors, column_name='상�
         style = cv.get('style') or DEFAULT_VENDOR_STYLE
         if not name:
             continue
+        info = VENDOR_STYLE_INFO.get(style, VENDOR_STYLE_INFO[DEFAULT_VENDOR_STYLE])
+        if info.get('base') == 'pre_expansion':
+            continue
         fname = f'{name}.xlsx'
         if fname in outputs:
             warnings.append(f"'{fname}'은 이미 기존 판매처 파일과 이름이 겹쳐 새로 추가하지 않았습니다.")
             continue
-        info = VENDOR_STYLE_INFO.get(style, VENDOR_STYLE_INFO[DEFAULT_VENDOR_STYLE])
         df_new = df_dudu.copy()
         if column_name in df_new.columns:
             df_new[column_name] = df_new[column_name].astype(str).apply(info['name_fn'])
         outputs[fname] = df_to_xlsx_bytes(df_new, sheet_name=info['sheet'])
     return outputs, warnings
+
+
+def build_pre_expansion_vendor_wb_bytes(base_bytes, name_fn):
+    """문정희 파일과 동일한 시점(0단계, 사이즈/색상으로 나뉘기 전)의 스냅샷을 기반으로
+    새 판매처 파일을 만듭니다. 상품명 열에 지정된 name_fn 스타일만 적용합니다
+    (문정희 전용인 '[상시의류]' 접두어는 붙이지 않습니다)."""
+    wb = load_wb(base_bytes, data_only=False)
+    ws = wb.active
+
+    name_col = None
+    for cell in ws[1]:
+        if cell.value == '상품명':
+            name_col = cell.column
+            break
+
+    if name_col is not None:
+        for r in range(2, ws.max_row + 1):
+            cell = ws.cell(row=r, column=name_col)
+            if isinstance(cell.value, str):
+                cell.value = name_fn(cell.value)
+
+    return wb_bytes(wb)
+
+
+def add_custom_vendor_stage1_files(stage1_outputs, pre_expansion_base_bytes, custom_vendors):
+    """custom_vendors 중 base가 'pre_expansion'인 스타일(사이즈분류전 2/5번시트)만 처리해,
+    문정희/곽충현과 같은 방식으로 stage1(예제생성 파일)에 새 판매처 파일을 추가합니다.
+
+    카테고리 매핑은 여기서 하지 않습니다 — run_pipeline에서 문정희/곽충현과 함께
+    apply_category_mapping_to_self()로 일괄 처리합니다.
+
+    반환: (stage1_outputs, 추가된 파일명 목록, 경고 목록)
+    """
+    warnings = []
+    added = []
+    for cv in custom_vendors:
+        name = safe_str(cv.get('name')).strip()
+        style = cv.get('style') or DEFAULT_VENDOR_STYLE
+        if not name:
+            continue
+        info = VENDOR_STYLE_INFO.get(style, VENDOR_STYLE_INFO[DEFAULT_VENDOR_STYLE])
+        if info.get('base') != 'pre_expansion':
+            continue
+        fname = f'{name}.xlsx'
+        if fname in stage1_outputs:
+            warnings.append(f"'{fname}'은 이미 기존 예제생성 파일과 이름이 겹쳐 새로 추가하지 않았습니다.")
+            continue
+        stage1_outputs[fname] = build_pre_expansion_vendor_wb_bytes(pre_expansion_base_bytes, info['name_fn'])
+        added.append(fname)
+    return stage1_outputs, added, warnings
 
 
 # =========================================================
@@ -1086,17 +1213,31 @@ def run_pipeline(
 
     excluded_vendors: 생성하지 않을 판매처 이름(확장자 제외) 목록/집합. 곽충현/문정희(1단계)와
         18개 판매처 파일(2단계, X파일 제외) 중에서 고를 수 있습니다.
-    custom_vendors: 새로 추가할 판매처 목록. 각 항목은
-        {'name': str, 'style': '2번시트'|'3번시트'|'5번시트', 'category_value': str} 형태이며,
-        두두사사 데이터를 선택한 스타일로 상품명만 정리한 새 판매처 파일을 만들고,
-        category_value가 있으면 카테고리번호.xlsx에 그 이름의 컬럼을 추가(또는 재사용)해
-        모든 행에 같은 값을 채웁니다.
+
+    custom_vendors: 새로 추가할 판매처 목록. 각 항목은 다음 형태의 dict입니다:
+        {
+            'name': str,                          # 필수. 파일명이 됩니다.
+            'style': VENDOR_STYLE_INFO의 키 중 하나,  # 상품명 처리 스타일 (기본값 DEFAULT_VENDOR_STYLE)
+            'category_mode': 'copy' | 'value' | 'none' (또는 생략),
+            'category_source': str,   # category_mode == 'copy'일 때: 값을 그대로 복사해올 기존 판매처 이름
+            'category_value': str,    # category_mode == 'value'일 때: 모든 행에 채울 값
+        }
+        style의 base가 'dudu'(2/3/5번시트)면 두두사사 데이터 기반으로 stage2에 파일이 생기고,
+        base가 'pre_expansion'(2/5번시트(사이즈분류전))이면 문정희/곽충현과 같은 시점의
+        데이터 기반으로 stage1에 파일이 생깁니다.
+        category_mode 'copy'는 카테고리번호.xlsx의 category_source 컬럼 값을 행별로 그대로
+        복사해 새 컬럼을 만듭니다(판매처마다 원본 코드별로 값이 다르므로 대부분 이 방식이
+        정확합니다). 'value'는 모든 행에 같은 값 하나를 채우는 단순 방식입니다(과거 방식,
+        하위 호환용으로 유지). 'none'이나 생략 시 카테고리 매핑 없이 파일만 생성합니다.
 
     반환: {
         'stage1': {파일명: bytes, ...},   # 예제/새기린/날짜파일/두두사사/다음S파일/카테고리번호/곽충현/문정희
-                                          # (곽충현/문정희는 카테고리번호.xlsx의 '곽충현'/'문정희' 컬럼이
-                                          #  있으면 그 값으로 E열이 매핑된 상태로 생성됩니다)
-        'stage2': {파일명: bytes, ...},   # 18개 판매처 파일(문정희 제외, 1단계에서 생성) + N파일(500행 초과 시 -1, -2...로 분할)
+                                          # + custom_vendors 중 base='pre_expansion' 스타일
+                                          # (곽충현/문정희 및 위 신규 판매처는 카테고리번호.xlsx의
+                                          #  동명 컬럼이 있으면 그 값으로 E열이 매핑된 상태로 생성됩니다)
+        'stage2': {파일명: bytes, ...},   # 18개 판매처 파일(문정희 제외, 1단계에서 생성)
+                                          # + custom_vendors 중 base='dudu' 스타일
+                                          # + N파일(500행 초과 시 -1, -2...로 분할)
         'logs': [str, ...],
         'errors': [str, ...],
     }
@@ -1137,21 +1278,45 @@ def run_pipeline(
 
     # 새로 추가하는 판매처가 있으면, 카테고리 매핑표(mapping_df)를 읽기 전에 먼저
     # 카테고리번호.xlsx에 해당 판매처 컬럼을 추가/갱신해둡니다 — 그래야 바로 아래에서
-    # mapping_df를 다시 읽을 때 새 컬럼이 함께 반영되어, 2단계 카테고리 매핑이 이 신규
+    # mapping_df를 다시 읽을 때 새 컬럼이 함께 반영되어, 카테고리 매핑이 이 신규
     # 판매처 파일에도 자동으로 적용됩니다.
     for cv in custom_vendors:
         cv_name = safe_str(cv.get('name')).strip()
-        cv_value = cv.get('category_value')
-        if not cv_name or cv_value in (None, ''):
+        if not cv_name:
             continue
-        category_bytes_updated, used_name, is_new = add_vendor_category_column(
-            category_bytes_updated, cv_name, cv_value
-        )
-        logs.append(
-            f"카테고리번호.xlsx에 '{used_name}' 컬럼을 "
-            + ("새로 추가하고" if is_new else "기존 컬럼을 그대로 사용해서")
-            + f" 모든 행에 '{cv_value}' 값을 채웠습니다."
-        )
+        mode = cv.get('category_mode')
+        if not mode:
+            # 하위 호환: category_mode가 없으면 예전 방식대로 category_value 유무로 판단
+            mode = 'value' if cv.get('category_value') not in (None, '') else 'none'
+
+        if mode == 'copy':
+            source = safe_str(cv.get('category_source')).strip()
+            if not source:
+                continue
+            category_bytes_updated, used_name, is_new, copy_err = copy_vendor_category_column(
+                category_bytes_updated, cv_name, source
+            )
+            if copy_err:
+                errors.append(f"'{cv_name}' 판매처 카테고리 설정 실패: {copy_err}")
+            else:
+                logs.append(
+                    f"카테고리번호.xlsx에 '{used_name}' 컬럼을 "
+                    + ("새로 추가하고" if is_new else "기존 컬럼을 그대로 사용해서")
+                    + f" '{source}' 판매처와 동일한 값(행별)으로 채웠습니다."
+                )
+        elif mode == 'value':
+            cv_value = cv.get('category_value')
+            if cv_value in (None, ''):
+                continue
+            category_bytes_updated, used_name, is_new = add_vendor_category_column(
+                category_bytes_updated, cv_name, cv_value
+            )
+            logs.append(
+                f"카테고리번호.xlsx에 '{used_name}' 컬럼을 "
+                + ("새로 추가하고" if is_new else "기존 컬럼을 그대로 사용해서")
+                + f" 모든 행에 '{cv_value}' 값을 채웠습니다."
+            )
+        # mode == 'none'이면 카테고리 컬럼을 건드리지 않습니다.
 
     stage1 = {
         '예제.xlsx': state['example_bytes'],
@@ -1166,6 +1331,14 @@ def run_pipeline(
     if '문정희' not in excluded_vendors:
         stage1['문정희.xlsx'] = state['moon_bytes']
 
+    # custom_vendors 중 '사이즈분류전' 스타일은 문정희/곽충현과 같은 시점(0단계 스냅샷)
+    # 데이터를 기반으로 만들어 stage1에 추가합니다. 카테고리 매핑은 바로 아래에서
+    # 문정희/곽충현과 함께 일괄 처리됩니다.
+    stage1, added_stage1_custom_names, stage1_custom_warnings = add_custom_vendor_stage1_files(
+        stage1, state['kwak_bytes'], custom_vendors
+    )
+    logs += stage1_custom_warnings
+
     # 2단계 (자동업데이트파일생성 2026)
     try:
         mapping_df = pd.read_excel(io.BytesIO(category_bytes_updated), dtype=str)
@@ -1174,7 +1347,9 @@ def run_pipeline(
         mapping_df = None
 
     if mapping_df is not None:
-        stage1, moon_kwak_warnings = apply_category_mapping_to_self(stage1, mapping_df)
+        stage1, moon_kwak_warnings = apply_category_mapping_to_self(
+            stage1, mapping_df, keys=('문정희.xlsx', '곽충현.xlsx', *added_stage1_custom_names)
+        )
         logs += moon_kwak_warnings
 
     stage2 = {}

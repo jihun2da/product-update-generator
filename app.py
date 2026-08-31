@@ -70,6 +70,27 @@ def save_default_to_github(github_path: str, new_bytes: bytes, commit_message: s
     except Exception as e:
         return False, f"깃허브 저장 중 오류: {e}"
 
+def load_category_vendor_names(category_bytes) -> list:
+    """카테고리번호.xlsx(bytes)의 1행 헤더 중 '원본'을 제외한 판매처 이름 목록을 반환합니다.
+    새 판매처를 추가할 때 '이 판매처와 동일한 카테고리 값 복사' 선택지에 씁니다."""
+    if not category_bytes:
+        return []
+    try:
+        wb = pl.load_wb(category_bytes, data_only=False)
+        ws = wb.active
+        names = []
+        for c in range(1, ws.max_column + 1):
+            v = ws.cell(row=1, column=c).value
+            if v is None:
+                continue
+            v = str(v).strip()
+            if v and v != '원본':
+                names.append(v)
+        return names
+    except Exception:
+        return []
+
+
 def load_vendor_config() -> dict:
     """앱에 저장된 '판매처 삭제/추가' 기본 설정(판매처설정_기본.json)을 읽어옵니다.
     파일이 없거나 읽기 실패하면 빈 설정(제외 없음, 추가 없음)을 반환합니다."""
@@ -149,13 +170,32 @@ with st.sidebar:
             help="여기서 선택한 판매처는 이번 실행부터 결과물(다운로드 목록/ZIP)에서 빠집니다.",
         )
 
+    # 새 판매처의 카테고리 매핑 방식 선택지 (내부 key -> 화면 표시 라벨)
+    CATEGORY_MODE_LABELS = {
+        "copy": "기존 판매처와 동일한 값 사용 (권장)",
+        "value": "모든 행에 같은 값 하나 입력",
+        "none": "카테고리 매핑 안 함 (파일만 생성)",
+    }
+
+    # 카테고리번호.xlsx는 판매처마다(컬럼마다) 원본 코드별로 값이 다릅니다(상품 종류별로
+    # 분류가 다르기 때문) — 그래서 "복사할 기존 판매처 선택" 옵션에 쓸 이름 목록을,
+    # 지금 화면에 올라와 있는(또는 앱 기본) 카테고리번호.xlsx에서 미리 읽어둡니다.
+    if category_file is not None:
+        _category_bytes_for_ui = category_file.getvalue()
+    elif ASSET_CATEGORY_PATH.exists():
+        _category_bytes_for_ui = ASSET_CATEGORY_PATH.read_bytes()
+    else:
+        _category_bytes_for_ui = None
+    existing_vendor_names_for_copy = load_category_vendor_names(_category_bytes_for_ui)
+
     with st.expander("새 판매처 파일 추가", expanded=False):
         st.caption(
             "예제생성/판매처 파일과 같은 스타일(상품명 처리 방식)로 새 판매처 파일을 추가합니다. "
-            "카테고리 값을 입력하면 카테고리번호.xlsx에 그 이름의 컬럼을 만들고(이미 있으면 재사용) "
-            "모든 행에 같은 값을 채웁니다 — 코드별로 다른 값이 필요하면 나중에 카테고리번호.xlsx를 "
-            "직접 열어 행별로 수정하시면 됩니다."
+            "카테고리번호.xlsx는 판매처마다 상품 코드별로 값이 다르므로, 대부분은 이미 설정되어 "
+            "있는 비슷한 판매처를 골라 '기존 판매처와 동일한 값 사용'을 쓰는 것이 정확합니다."
         )
+
+        editing_idx = st.session_state.get("editing_custom_vendor_index")
 
         if st.session_state["custom_vendor_list"]:
             st.write("현재 추가된 판매처:")
@@ -163,16 +203,43 @@ with st.sidebar:
                 style_label = pl.VENDOR_STYLE_INFO.get(
                     cv.get("style", pl.DEFAULT_VENDOR_STYLE), {}
                 ).get("label", cv.get("style", ""))
-                col_a, col_b = st.columns([5, 1])
+                mode = cv.get("category_mode")
+                if not mode:
+                    mode = "value" if cv.get("category_value") else "none"
+                if mode == "copy":
+                    cat_desc = f"'{cv.get('category_source')}'와 동일한 값 사용"
+                elif mode == "value":
+                    cat_desc = f"모든 행 '{cv.get('category_value')}'"
+                else:
+                    cat_desc = "매핑 안 함"
+                col_a, col_b, col_c = st.columns([5, 1, 1])
                 with col_a:
-                    val = cv.get("category_value") or "(카테고리 값 없음)"
-                    st.write(f"• **{cv.get('name')}** — {style_label} · 카테고리 값: {val}")
+                    prefix = "✏️ " if idx == editing_idx else "• "
+                    st.write(f"{prefix}**{cv.get('name')}** — {style_label} · 카테고리: {cat_desc}")
                 with col_b:
+                    if st.button("수정", key=f"edit_custom_vendor_{idx}"):
+                        st.session_state["editing_custom_vendor_index"] = idx
+                        st.session_state["new_vendor_name"] = cv.get("name", "")
+                        st.session_state["new_vendor_style"] = cv.get(
+                            "style", pl.DEFAULT_VENDOR_STYLE
+                        )
+                        st.session_state["new_vendor_category_mode"] = mode
+                        if mode == "copy" and cv.get("category_source") in existing_vendor_names_for_copy:
+                            st.session_state["new_vendor_category_source"] = cv.get("category_source")
+                        st.session_state["new_vendor_category_value"] = cv.get("category_value", "")
+                        st.rerun()
+                with col_c:
                     if st.button("삭제", key=f"remove_custom_vendor_{idx}"):
                         st.session_state["custom_vendor_list"].pop(idx)
+                        if editing_idx == idx:
+                            st.session_state.pop("editing_custom_vendor_index", None)
                         st.rerun()
 
-        st.markdown("**새 판매처 추가**")
+        if editing_idx is not None:
+            st.markdown(f"**판매처 수정 중: {st.session_state['custom_vendor_list'][editing_idx].get('name')}**")
+        else:
+            st.markdown("**새 판매처 추가**")
+
         new_vendor_name = st.text_input("판매처 이름 (파일명이 됩니다, 예: 신규거래처)", key="new_vendor_name")
         new_vendor_style = st.selectbox(
             "상품명 처리 스타일",
@@ -180,24 +247,77 @@ with st.sidebar:
             format_func=lambda k: pl.VENDOR_STYLE_INFO[k]["label"],
             key="new_vendor_style",
         )
-        new_vendor_category_value = st.text_input(
-            "카테고리 값 (선택 — 비워두면 카테고리 매핑 없이 파일만 생성)",
-            key="new_vendor_category_value",
+        new_vendor_category_mode = st.radio(
+            "카테고리 매핑 방식",
+            options=list(CATEGORY_MODE_LABELS.keys()),
+            format_func=lambda k: CATEGORY_MODE_LABELS[k],
+            key="new_vendor_category_mode",
         )
+        if new_vendor_category_mode == "copy":
+            if existing_vendor_names_for_copy:
+                # 카테고리번호.xlsx가 이전 화면과 달라져 선택돼 있던 값이 더 이상 목록에
+                # 없으면(예: 다른 카테고리번호.xlsx를 새로 업로드), selectbox가 오류 없이
+                # 뜨도록 첫 번째 항목으로 되돌려둡니다.
+                if st.session_state.get("new_vendor_category_source") not in existing_vendor_names_for_copy:
+                    st.session_state["new_vendor_category_source"] = existing_vendor_names_for_copy[0]
+                new_vendor_category_source = st.selectbox(
+                    "복사할 기존 판매처 선택",
+                    options=existing_vendor_names_for_copy,
+                    key="new_vendor_category_source",
+                    help="선택한 판매처의 카테고리번호.xlsx 값을 행(상품 코드)별로 그대로 복사해 옵니다.",
+                )
+            else:
+                new_vendor_category_source = None
+                st.warning("카테고리번호.xlsx에서 판매처 목록을 읽지 못했습니다. 먼저 카테고리번호.xlsx를 확인해주세요.")
+            new_vendor_category_value = ""
+        elif new_vendor_category_mode == "value":
+            new_vendor_category_source = None
+            new_vendor_category_value = st.text_input(
+                "카테고리 값 (모든 행에 동일하게 채워집니다)",
+                key="new_vendor_category_value",
+            )
+        else:
+            new_vendor_category_source = None
+            new_vendor_category_value = ""
 
-        if st.button("+ 판매처 추가", key="add_custom_vendor_btn"):
+        btn_col1, btn_col2 = st.columns([1, 1])
+        with btn_col1:
+            submit_label = "저장" if editing_idx is not None else "+ 판매처 추가"
+            submit_clicked = st.button(submit_label, key="add_custom_vendor_btn", use_container_width=True)
+        with btn_col2:
+            cancel_clicked = False
+            if editing_idx is not None:
+                cancel_clicked = st.button("수정 취소", key="cancel_edit_custom_vendor_btn", use_container_width=True)
+
+        if cancel_clicked:
+            st.session_state.pop("editing_custom_vendor_index", None)
+            st.rerun()
+
+        if submit_clicked:
             name = new_vendor_name.strip()
-            existing_names = {c.get("name") for c in st.session_state["custom_vendor_list"]}
+            other_entries = [
+                c for i, c in enumerate(st.session_state["custom_vendor_list"]) if i != editing_idx
+            ]
+            existing_names = {c.get("name") for c in other_entries}
             if not name:
                 st.warning("판매처 이름을 입력해주세요.")
             elif name in pl.ALL_OPTIONAL_VENDOR_NAMES or name in existing_names:
                 st.warning(f"'{name}'은 이미 사용 중인 판매처 이름입니다. 다른 이름을 입력해주세요.")
+            elif new_vendor_category_mode == "copy" and not new_vendor_category_source:
+                st.warning("복사할 기존 판매처를 선택해주세요.")
             else:
-                st.session_state["custom_vendor_list"].append({
+                new_entry = {
                     "name": name,
                     "style": new_vendor_style,
+                    "category_mode": new_vendor_category_mode,
+                    "category_source": new_vendor_category_source or "",
                     "category_value": new_vendor_category_value.strip(),
-                })
+                }
+                if editing_idx is not None:
+                    st.session_state["custom_vendor_list"][editing_idx] = new_entry
+                    st.session_state.pop("editing_custom_vendor_index", None)
+                else:
+                    st.session_state["custom_vendor_list"].append(new_entry)
                 st.rerun()
 
     save_vendor_config_default = st.checkbox(
