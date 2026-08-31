@@ -9,8 +9,10 @@
   "custom_vendors": [
     {
       "name": "홍일진",
-      "style": "5번시트",
-      "category_value": "홍일진"
+      "style": "5번시트(사이즈분류전)",
+      "category_mode": "copy",
+      "category_source": "홍일진",
+      "category_value": ""
     }
   ]
 }
