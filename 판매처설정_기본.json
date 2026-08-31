@@ -2,7 +2,15 @@
   "excluded_vendors": [
     "현건주",
     "백종열",
-    "이지민"
+    "이지민",
+    "최은경",
+    "백성희"
   ],
-  "custom_vendors": []
+  "custom_vendors": [
+    {
+      "name": "홍일진",
+      "style": "5번시트",
+      "category_value": "홍일진"
+    }
+  ]
 }
