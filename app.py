@@ -9,6 +9,7 @@ import requests
 import streamlit as st
 
 import pipeline as pl
+import cafe24_upload_ui as up_ui
 
 ASSET_CATEGORY_PATH = Path(__file__).parent / "카테고리번호_기본.xlsx"
 ASSET_TEMPLATE_PATH = Path(__file__).parent / "스마트스토어기본_기본.xlsx"
@@ -432,6 +433,16 @@ if run_clicked:
             st.exception(e)
             st.stop()
 
+    # 아래 "생성된 파일 선택 → 카페24 업로드" 섹션은 자체 위젯(선택 목록, 업로드 시작
+    # 버튼 등)을 가지고 있어서, 그 위젯을 조작할 때마다 이 페이지 전체가 다시 실행됩니다.
+    # 그때 run_clicked는 다시 False가 되므로, result를 세션 상태에 저장해두고 아래
+    # 결과 표시 블록은 (run_clicked가 아니라) 이 세션 상태를 기준으로 렌더링합니다 —
+    # 그래야 새 업로드 섹션을 쓰는 동안에도 방금 생성한 결과가 화면에서 사라지지 않습니다.
+    st.session_state["last_pipeline_result"] = result
+
+result = st.session_state.get("last_pipeline_result")
+
+if result:
     if result["errors"]:
         st.error("아래 오류가 발생했습니다. 결과가 일부 누락됐을 수 있습니다.")
         for e in result["errors"]:
@@ -462,5 +473,49 @@ if run_clicked:
         st.subheader("2단계 결과 (판매처별 최종 파일)")
         for name, data in result["stage2"].items():
             st.download_button(name, data=data, file_name=name, key=f"s2_{name}")
+
+    st.divider()
+    st.header("생성된 파일 선택 → 카페24 업로드")
+    st.caption(
+        "위에서 만든 1단계 + 2단계 파일 중, 카페24에 바로 업로드할 파일을 선택하면 다운로드 후 "
+        "다시 올릴 필요 없이 곧바로 업로드를 진행할 수 있습니다. 계정 매칭 규칙(파일명 일치, "
+        "날짜 접미사 자동 인식 등)은 '카페24 자동 업로드' 페이지와 완전히 동일합니다."
+    )
+
+    accounts_for_upload = up_ui.load_accounts()
+
+    if not accounts_for_upload:
+        st.info(
+            "아직 Secrets에 등록된 카페24 계정이 없습니다. 왼쪽 사이드바 대신 '카페24 자동 업로드' "
+            "페이지의 '① Secrets 등록 도우미'에서 먼저 계정을 등록해주세요."
+        )
+    else:
+        all_generated_files = {**result["stage1"], **result["stage2"]}
+        st.caption(f"현재 Secrets에 등록된 계정 수: {len(accounts_for_upload)}개")
+
+        # 선택 목록의 기본값으로, 등록된 계정과 이미 매칭되는 파일명을 미리 계산해 선택해둡니다
+        # (파일명 일치/날짜 패턴 매칭 모두 반영). 사용자는 필요하면 자유롭게 더하거나 뺄 수 있습니다.
+        _preview_matched, _preview_unmatched, _preview_pattern, _preview_dup = up_ui.match_files_to_accounts(
+            all_generated_files, accounts_for_upload
+        )
+        _default_selected_names = sorted({m["file_name"] for m in _preview_matched})
+
+        selected_file_names = st.multiselect(
+            "업로드할 파일 선택 (기본값: 등록된 계정과 매칭되는 파일이 자동으로 선택되어 있습니다)",
+            options=sorted(all_generated_files.keys()),
+            default=_default_selected_names,
+            key="appgen_selected_files",
+        )
+
+        if not selected_file_names:
+            st.info("업로드할 파일을 선택해주세요.")
+        else:
+            selected_files = {name: all_generated_files[name] for name in selected_file_names}
+            matched_gen, unmatched_gen, pattern_gen, dup_gen = up_ui.match_files_to_accounts(
+                selected_files, accounts_for_upload
+            )
+            up_ui.render_match_preview(matched_gen, unmatched_gen, pattern_gen, dup_gen)
+            st.subheader("업로드 실행")
+            up_ui.render_execution_and_results(matched_gen, key_prefix="appgen_")
 else:
     st.info("왼쪽에서 파일을 올리고 '전체 파이프라인 실행'을 눌러주세요.")
