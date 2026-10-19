@@ -15,11 +15,23 @@ import io
 import re
 from collections import defaultdict
 from datetime import datetime
+from pathlib import Path
 
 import pandas as pd
 import openpyxl
 from openpyxl.styles import Alignment
 from openpyxl.utils import column_index_from_string
+
+# 블로그페이 파일 생성 모듈 (xlrd/xlwt/xlutils 필요). 불러오기에 실패해도
+# 앱 전체가 멈추지 않도록, 실패하면 블로그페이 파일만 건너뜁니다.
+try:
+    import blogpay
+    _BLOGPAY_IMPORT_ERROR = None
+except Exception as _e:  # pragma: no cover
+    blogpay = None
+    _BLOGPAY_IMPORT_ERROR = str(_e)
+
+BLOGPAY_TEMPLATE_PATH = Path(__file__).parent / "블로그페이_기본.xls"
 
 
 # =========================================================
@@ -115,7 +127,7 @@ class PipelineError(Exception):
 #   반드시 필요한 파이프라인 내부 산출물이라 제외 대상에 넣지 않습니다.
 # - DEFAULT_STAGE2_VENDORS: 2단계 판매처별 파일 18개 중, X{날짜}.xlsx는 스마트스토어(N파일)
 #   변환의 원본 데이터로 내부적으로 반드시 필요해 제외 대상에서 뺐습니다.
-DEFAULT_STAGE1_VENDOR_STYLE_FILES = ['곽충현', '문정희']
+DEFAULT_STAGE1_VENDOR_STYLE_FILES = ['곽충현', '문정희', '블로그페이']
 
 DEFAULT_STAGE2_VENDORS = [
     '김하늘', '서송이', '이지민', '해피', '김다혜', '박미리',
@@ -1330,6 +1342,24 @@ def run_pipeline(
         stage1['곽충현.xlsx'] = state['kwak_bytes']
     if '문정희' not in excluded_vendors:
         stage1['문정희.xlsx'] = state['moon_bytes']
+
+    # 블로그페이 파일: 업로드한 S파일 원본으로 블로그페이 양식(.xls)을 채워 1단계 결과물에 추가.
+    # 실패해도 다른 결과물에는 영향이 없도록 오류는 errors에만 기록합니다.
+    if '블로그페이' not in excluded_vendors:
+        if blogpay is None:
+            errors.append(f"블로그페이 파일 생성 실패: 모듈을 불러오지 못했습니다 ({_BLOGPAY_IMPORT_ERROR}). "
+                          "requirements.txt의 xlrd/xlwt/xlutils 설치를 확인해주세요.")
+        elif not BLOGPAY_TEMPLATE_PATH.exists():
+            errors.append("블로그페이 파일 생성 실패: 앱 폴더에 '블로그페이_기본.xls' 양식 파일이 없습니다.")
+        else:
+            try:
+                bp_bytes, bp_logs = blogpay.build_blogpay_xls(
+                    sfile_bytes, BLOGPAY_TEMPLATE_PATH.read_bytes()
+                )
+                stage1[f'블로그페이_완성_{dated_str}.xls'] = bp_bytes
+                logs += bp_logs
+            except Exception as e:
+                errors.append(f"블로그페이 파일 생성 실패: {e}")
 
     # custom_vendors 중 '사이즈분류전' 스타일은 문정희/곽충현과 같은 시점(0단계 스냅샷)
     # 데이터를 기반으로 만들어 stage1에 추가합니다. 카테고리 매핑은 바로 아래에서

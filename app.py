@@ -490,7 +490,12 @@ if result:
             "페이지의 '① Secrets 등록 도우미'에서 먼저 계정을 등록해주세요."
         )
     else:
-        all_generated_files = {**result["stage1"], **result["stage2"]}
+        # 블로그페이 파일(.xls)은 카페24 업로드 대상이 아니므로 업로드 선택 목록에서 뺍니다.
+        all_generated_files = {
+            name: data
+            for name, data in {**result["stage1"], **result["stage2"]}.items()
+            if not name.lower().endswith(".xls")
+        }
         st.caption(f"현재 Secrets에 등록된 계정 수: {len(accounts_for_upload)}개")
 
         # 선택 목록의 기본값으로, 등록된 계정과 이미 매칭되는 파일명을 미리 계산해 선택해둡니다
