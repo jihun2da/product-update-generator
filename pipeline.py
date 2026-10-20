@@ -714,6 +714,43 @@ def update_category_file(category_bytes, new_code, target_row=29):
 # 2단계: 자동업데이트파일생성(2026).py 로직
 # =========================================================
 
+def build_kim_haneul_bytes(snapshot_bytes):
+    """김하늘 파일: 옵션(색상/사이즈)으로 나뉘기 전의 S파일(기린 E,F,G 복사 상태 = 곽충현과 같은 시점)을
+    기반으로 만듭니다. 옵션입력의 추가금액(예: 13(+1000))은 그대로 남아 있습니다.
+    기존 규칙 유지: 소비자가 / 판매가 = 공급가 * 1.7 (반올림).
+    반환: (bytes, 경고 목록)"""
+    warnings = []
+    wb = load_wb(snapshot_bytes, data_only=False)
+    ws = wb.active
+
+    cols = {}
+    for cell in ws[1]:
+        name = safe_str(cell.value).strip()
+        if name and name not in cols:
+            cols[name] = cell.column
+
+    if all(c in cols for c in ['소비자가', '공급가', '판매가']):
+        bad_rows = 0
+        for r in range(2, ws.max_row + 1):
+            raw = ws.cell(row=r, column=cols['공급가']).value
+            try:
+                supply = float(str(raw).replace(',', '').strip())
+            except (TypeError, ValueError):
+                if safe_str(raw).strip() != '':
+                    bad_rows += 1
+                continue
+            price = int(round(supply * 1.7))
+            ws.cell(row=r, column=cols['소비자가']).value = price
+            ws.cell(row=r, column=cols['판매가']).value = price
+        if bad_rows:
+            warnings.append(f"김하늘.xlsx: 공급가를 숫자로 읽을 수 없는 행이 {bad_rows}개 있어 해당 행의 가격(x1.7)을 계산하지 못했습니다.")
+    else:
+        warnings.append("김하늘.xlsx: 소비자가/공급가/판매가 열을 찾지 못해 가격(x1.7) 계산을 건너뛰었습니다.")
+
+    ws.title = "2번시트"
+    return wb_bytes(wb), warnings
+
+
 def process_cafe24(dudu_bytes, today_str, excluded=None):
     """excluded: 생성하지 않을 판매처 이름(확장자 제외) 집합/리스트. None이면 기존과 동일하게
     18개 판매처 전부 생성합니다. X{today_str}.xlsx는 스마트스토어(N파일) 변환에 내부적으로
@@ -731,15 +768,9 @@ def process_cafe24(dudu_bytes, today_str, excluded=None):
     # 2번시트 그룹
     df_sheet2 = df.copy()
 
-    # 김하늘: 소비자가(T열)/판매가(V열) = 공급가(U열) * 1.7
-    if '김하늘' not in excluded:
-        df_kim_haneul = df_sheet2.copy()
-        if all(c in df_kim_haneul.columns for c in ['소비자가', '공급가', '판매가']):
-            supply_numeric = pd.to_numeric(df_kim_haneul['공급가'], errors='coerce')
-            computed_price = (supply_numeric * 1.7).round()
-            df_kim_haneul['소비자가'] = computed_price
-            df_kim_haneul['판매가'] = computed_price
-        outputs['김하늘.xlsx'] = df_to_xlsx_bytes(df_kim_haneul, sheet_name="2번시트")
+    # 김하늘: 예전에는 여기서 두두사사(옵션 분리 후) 데이터로 만들었지만, 이제는 옵션 분리 전
+    # S파일(기린 E,F,G 복사 상태)에서 만듭니다. -> run_pipeline() 끝부분의 build_kim_haneul_bytes() 참고
+    # (소비자가/판매가 = 공급가 * 1.7 규칙은 그대로 유지됩니다)
 
     # 서송이: 적립금(AB열) 값을 모두 비움
     if '서송이' not in excluded:
@@ -817,7 +848,7 @@ def process_cafe24(dudu_bytes, today_str, excluded=None):
             df_choi['진열상태'] = 'N'
         if '판매상태' in df_choi.columns:
             df_choi['판매상태'] = 'N'
-        df_choi[column_name] = df_choi[column_name].astype(str) + f' 26가을 {label}'
+        df_choi[column_name] = df_choi[column_name].astype(str) + f' 26겨울 {label}'
         outputs[f'{label}.xlsx'] = df_to_xlsx_bytes(df_choi, sheet_name="5번시트")
 
     # 문정희.xlsx는 1단계(build_example_state)에서 이미 최종본으로 생성되므로
@@ -1432,6 +1463,23 @@ def run_pipeline(
         errors.append(str(e))
     except Exception as e:
         errors.append(f"2단계 처리 중 예상치 못한 오류: {e}")
+
+    # 김하늘: 옵션 분리 전 S파일(기린 E,F,G 복사 상태)에서 직접 생성 (2단계_판매처파일에 저장).
+    # 2단계 카테고리 매핑(apply_category_mapping)은 두두사사 행 순서 기준이라 행 수가 다른
+    # 이 파일에는 맞지 않으므로, 곽충현/문정희처럼 파일 자신의 E열 값으로 매핑합니다.
+    if '김하늘' not in excluded_vendors:
+        try:
+            kim_bytes, kim_warnings = build_kim_haneul_bytes(state['kwak_bytes'])
+            logs += kim_warnings
+            kim_outputs = {'김하늘.xlsx': kim_bytes}
+            if mapping_df is not None:
+                kim_outputs, kim_map_warnings = apply_category_mapping_to_self(
+                    kim_outputs, mapping_df, keys=('김하늘.xlsx',)
+                )
+                logs += kim_map_warnings
+            stage2['김하늘.xlsx'] = kim_outputs['김하늘.xlsx']
+        except Exception as e:
+            errors.append(f"김하늘 파일 생성 실패: {e}")
 
     return {
         'stage1': stage1,
